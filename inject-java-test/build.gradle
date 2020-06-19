@@ -1,4 +1,9 @@
 dependencies {
+    compileOnly "org.projectlombok:lombok:1.18.12"
+    annotationProcessor "org.projectlombok:lombok:1.18.12"
+    testImplementation "org.projectlombok:lombok:1.18.12"
+    testAnnotationProcessor "org.projectlombok:lombok:1.18.12"
+
     annotationProcessor project(":inject-java")
     
     api project(":inject-java")    

@@ -27,6 +27,7 @@ import io.micronaut.core.order.OrderUtil;
 import io.micronaut.core.util.StringUtils;
 import io.micronaut.core.version.VersionUtils;
 import io.micronaut.inject.annotation.AnnotationMetadataHierarchy;
+import io.micronaut.inject.beans.visitor.IntrospectedTypeElementVisitor;
 import io.micronaut.inject.processing.JavaModelUtils;
 import io.micronaut.inject.visitor.TypeElementVisitor;
 import io.micronaut.inject.visitor.VisitorContext;
@@ -66,6 +67,8 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
 
     private List<LoadedVisitor> loadedVisitors;
     private Collection<TypeElementVisitor> typeElementVisitors;
+    private Collection<String> deferredElements = new ArrayList<>();
+    private Collection<TypeElementVisitor> deferredVisitors = new HashSet<>();
 
     @Override
     public synchronized void init(ProcessingEnvironment processingEnv) {
@@ -181,6 +184,23 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
     public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
 
         if (!loadedVisitors.isEmpty()) {
+            Set<TypeElementVisitor> finishVisitors = new HashSet<>();
+
+            if (!deferredElements.isEmpty()) {
+                for (String deferredElement : deferredElements) {
+                    TypeElement typeElement = processingEnv.getElementUtils().getTypeElement(deferredElement);
+                    List<LoadedVisitor> matchedVisitors = loadedVisitors.stream()
+                            .filter(v -> shouldBeDeferred(typeElement, v.getVisitor()) && v.matches(typeElement))
+                            .collect(Collectors.toList());
+                    if (!matchedVisitors.isEmpty()) {
+                        typeElement.accept(new ElementVisitor(typeElement, matchedVisitors), deferredElement);
+                        finishVisitors.addAll(matchedVisitors.stream().map(LoadedVisitor::getVisitor).collect(Collectors.toSet()));
+                    }
+                }
+                deferredElements.clear();
+                finishVisitors.addAll(deferredVisitors);
+                deferredVisitors.clear();
+            }
 
             TypeElement groovyObjectTypeElement = elementUtils.getTypeElement("groovy.lang.GroovyObject");
             TypeMirror groovyObjectType = groovyObjectTypeElement != null ? groovyObjectTypeElement.asType() : null;
@@ -193,20 +213,51 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
                     .filter(typeElement -> typeElement == null || (groovyObjectType == null || !typeUtils.isAssignable(typeElement.asType(), groovyObjectType)))
                     .forEach((typeElement) -> {
                         String className = typeElement.getQualifiedName().toString();
-                        List<LoadedVisitor> matchedVisitors = loadedVisitors.stream().filter((v) -> v.matches(typeElement)).collect(Collectors.toList());
-                        typeElement.accept(new ElementVisitor(typeElement, matchedVisitors), className);
+                        List<LoadedVisitor> matchedVisitors = loadedVisitors.stream()
+                                .filter((v) -> v.matches(typeElement))
+                                .collect(Collectors.toList());
+
+                        Set<TypeElementVisitor> deferred = matchedVisitors.stream()
+                                .filter(v -> shouldBeDeferred(typeElement, v.getVisitor()))
+                                .map(LoadedVisitor::getVisitor)
+                                .collect(Collectors.toSet());
+                        if (!deferred.isEmpty()) {
+                            deferredElements.add(className);
+                            deferredVisitors.addAll(deferred);
+                        }
+
+                        List<LoadedVisitor> notDeferred = matchedVisitors
+                                .stream()
+                                .filter(v -> !shouldBeDeferred(typeElement, v.getVisitor()))
+                                .collect(Collectors.toList());
+                        if (!notDeferred.isEmpty()) {
+                            typeElement.accept(new ElementVisitor(typeElement, notDeferred), className);
+                            finishVisitors.addAll(notDeferred.stream().map(LoadedVisitor::getVisitor).collect(Collectors.toSet()));
+                        }
                     });
 
-            for (LoadedVisitor loadedVisitor : loadedVisitors) {
+            finishVisitors.removeAll(deferredVisitors);
+            for (TypeElementVisitor visitor : finishVisitors) {
                 try {
-                    loadedVisitor.getVisitor().finish(javaVisitorContext);
+                    visitor.finish(javaVisitorContext);
                 } catch (Throwable e) {
-                    error("Error finalizing type visitor [%s]: %s", loadedVisitor.getVisitor(), e.getMessage());
+                    error("Error finalizing type visitor [%s]: %s", visitor, e.getMessage());
                 }
             }
         }
 
+        if (roundEnv.processingOver() && !deferredElements.isEmpty()) {
+            error("Deferred elements not processed: [%s]", deferredElements);
+        }
+
         return false;
+    }
+
+    private boolean shouldBeDeferred(TypeElement typeElement, TypeElementVisitor visitor) {
+        return visitor instanceof IntrospectedTypeElementVisitor && annotationUtils.getAnnotationMetadata(typeElement)
+                .getAnnotationNames()
+                .stream()
+                .anyMatch(name -> name.startsWith("lombok"));
     }
 
     /**
