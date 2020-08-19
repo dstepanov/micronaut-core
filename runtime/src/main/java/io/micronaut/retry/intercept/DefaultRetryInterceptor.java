@@ -18,6 +18,7 @@ package io.micronaut.retry.intercept;
 import io.micronaut.aop.InterceptPhase;
 import io.micronaut.aop.MethodInterceptor;
 import io.micronaut.aop.MethodInvocationContext;
+import io.micronaut.aop.util.KotlinInvocationContextUtils;
 import io.micronaut.context.event.ApplicationEventPublisher;
 import io.micronaut.core.annotation.AnnotationValue;
 import io.micronaut.core.async.publisher.Publishers;
@@ -42,7 +43,12 @@ import javax.inject.Singleton;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 
 /**
@@ -152,6 +158,13 @@ public class DefaultRetryInterceptor implements MethodInterceptor<Object, Object
                     .orElseThrow(() -> new IllegalStateException("Unconvertible Reactive type: " + result));
             }
 
+        } else if (KotlinInvocationContextUtils.isKotlinCoroutine(context)) {
+            return KotlinInvocationContextUtils.handleKotlinCoroutine(context, helper -> {
+                retryState.open();
+                CompletableFuture newFuture = new CompletableFuture();
+                helper.replaceResult(newFuture);
+                helper.process().whenComplete(retryKotlinSuspend(newFuture, context, retryState));
+            });
         } else {
             retryState.open();
             while (true) {
@@ -220,7 +233,7 @@ public class DefaultRetryInterceptor implements MethodInterceptor<Object, Object
         };
     }
 
-    private  BiConsumer<Object, ? super Throwable> retryCompletable(CompletableFuture<Object> newFuture, MethodInvocationContext<Object, Object> context, MutableRetryState retryState) {
+    private BiConsumer<Object, ? super Throwable> retryCompletable(CompletableFuture<Object> newFuture, MethodInvocationContext<Object, Object> context, MutableRetryState retryState) {
         return (Object value, Throwable exception) -> {
             if (exception == null) {
                 retryState.close(null);
@@ -256,5 +269,42 @@ public class DefaultRetryInterceptor implements MethodInterceptor<Object, Object
             }
         };
 
+    }
+
+    private BiConsumer<Object, ? super Throwable> retryKotlinSuspend(CompletableFuture<Object> newFuture, MethodInvocationContext<Object, Object> context, MutableRetryState retryState) {
+        return (Object value, Throwable exception) -> {
+            if (exception == null) {
+                retryState.close(null);
+                newFuture.complete(value);
+                return;
+            }
+            if (retryState.canRetry(exception)) {
+                long delay = retryState.nextDelay();
+                if (eventPublisher != null) {
+                    try {
+                        eventPublisher.publishEvent(new RetryEvent(context, retryState, exception));
+                    } catch (Exception e) {
+                        LOG.error("Error occurred publishing RetryEvent: " + e.getMessage(), e);
+                    }
+                }
+                executorService.schedule(() -> {
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("Retrying execution for method [{}] after delay of {}ms for exception: {}",
+                                context,
+                                delay,
+                                (exception).getMessage());
+                    }
+                    KotlinInvocationContextUtils.handleKotlinCoroutine(context, helper -> {
+                        helper.process(this).whenComplete(retryKotlinSuspend(newFuture, context, retryState));
+                    });
+                }, delay, TimeUnit.MILLISECONDS);
+            } else {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Cannot retry anymore. Rethrowing original exception for method: {}", context);
+                }
+                retryState.close(exception);
+                newFuture.completeExceptionally(exception);
+            }
+        };
     }
 }
