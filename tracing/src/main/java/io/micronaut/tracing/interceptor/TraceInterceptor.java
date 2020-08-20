@@ -18,13 +18,12 @@ package io.micronaut.tracing.interceptor;
 import io.micronaut.aop.InterceptPhase;
 import io.micronaut.aop.MethodInterceptor;
 import io.micronaut.aop.MethodInvocationContext;
+import io.micronaut.aop.util.ReactiveMethodInterceptorHelper;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.core.annotation.AnnotationMetadata;
 import io.micronaut.core.annotation.AnnotationValue;
-import io.micronaut.core.async.publisher.Publishers;
 import io.micronaut.core.convert.ConversionService;
 import io.micronaut.core.type.Argument;
-import io.micronaut.core.type.ReturnType;
 import io.micronaut.core.util.StringUtils;
 import io.micronaut.tracing.annotation.ContinueSpan;
 import io.micronaut.tracing.annotation.NewSpan;
@@ -41,6 +40,7 @@ import javax.inject.Singleton;
 import java.util.HashMap;
 import java.util.Optional;
 import java.util.concurrent.CompletionStage;
+import java.util.function.Supplier;
 
 /**
  * An interceptor that implements tracing logic for {@link io.micronaut.tracing.annotation.ContinueSpan} and
@@ -89,42 +89,37 @@ public class TraceInterceptor implements MethodInterceptor<Object, Object> {
             return context.proceed();
         }
         Span currentSpan = tracer.activeSpan();
-        ReturnType<Object> returnType = context.getReturnType();
-        Class<Object> javaReturnType = returnType.getType();
-
         if (isContinue) {
             if (currentSpan == null) {
                 return context.proceed();
             }
+            return new ReactiveMethodInterceptorHelper(context) {
 
-            if (Publishers.isConvertibleToPublisher(javaReturnType)) {
-                Object returnObject = context.proceed();
-                if (returnObject == null || (returnObject instanceof TracingPublisher)) {
-                    return returnObject;
-                } else {
-                    Publisher<?> resultFlowable = conversionService.convert(returnObject, Publisher.class)
-                            .orElseThrow(() -> new IllegalStateException("Unsupported Reactive type: " + javaReturnType));
-
-                    resultFlowable = new TracingPublisher(resultFlowable, tracer) {
+                @Override
+                protected Publisher<Object> interceptPublisher(Publisher<Object> publisher) {
+                    if (publisher instanceof TracingPublisher) {
+                        return publisher;
+                    }
+                    return new TracingPublisher(publisher, tracer) {
                         @Override
                         protected void doOnSubscribe(@NonNull Span span) {
                             tagArguments(span, context);
                         }
                     };
-                    return conversionService.convert(
-                            resultFlowable,
-                            javaReturnType
-                    ).orElseThrow(() -> new IllegalStateException("Unsupported Reactive type: " + javaReturnType));
                 }
-            } else {
-                tagArguments(currentSpan, context);
-                try {
-                    return context.proceed();
-                } catch (RuntimeException e) {
-                    logError(currentSpan, e);
-                    throw e;
+
+                @Override
+                protected Object interceptDefault(MethodInvocationContext<Object, Object> context) {
+                    tagArguments(currentSpan, context);
+                    try {
+                        return context.proceed();
+                    } catch (RuntimeException e) {
+                        logError(currentSpan, e);
+                        throw e;
+                    }
                 }
-            }
+
+            }.intercept();
         } else {
             // must be new
             String operationName = newSpan.stringValue().orElse(null);
@@ -138,33 +133,28 @@ public class TraceInterceptor implements MethodInterceptor<Object, Object> {
                 builder.asChildOf(currentSpan);
             }
 
-            if (Publishers.isConvertibleToPublisher(javaReturnType)) {
-                Object returnedObject = context.proceed();
-                if (returnedObject == null || (returnedObject instanceof TracingPublisher)) {
-                    return returnedObject;
-                } else {
-                    Publisher<?> resultPublisher = conversionService.convert(returnedObject, Publisher.class)
-                            .orElseThrow(() -> new IllegalStateException("Unsupported Reactive type: " + javaReturnType));
+            return new ReactiveMethodInterceptorHelper(context) {
 
-                    resultPublisher = new TracingPublisher(resultPublisher, tracer, builder) {
+                @Override
+                protected Publisher<Object> interceptPublisher(Publisher<Object> publisher) {
+                    if (publisher instanceof TracingPublisher) {
+                        return publisher;
+                    }
+                    return new TracingPublisher(publisher, tracer, builder) {
                         @Override
                         protected void doOnSubscribe(@NonNull Span span) {
                             populateTags(context, hystrixCommand, span);
                         }
                     };
-
-                    return conversionService.convert(
-                            resultPublisher,
-                            javaReturnType
-                    ).orElseThrow(() -> new IllegalStateException("Unsupported Reactive type: " + javaReturnType));
                 }
-            } else {
-                if (CompletionStage.class.isAssignableFrom(javaReturnType)) {
+
+                @Override
+                protected CompletionStage<Object> lazyInterceptCompletionStage(Supplier<CompletionStage<Object>> resultSupplier) {
                     Span span = builder.start();
                     try (Scope ignored = tracer.scopeManager().activate(span)) {
                         populateTags(context, hystrixCommand, span);
                         try {
-                            CompletionStage<?> completionStage = (CompletionStage) context.proceed();
+                            CompletionStage<Object> completionStage = resultSupplier.get();
                             if (completionStage != null) {
 
                                 return completionStage.whenComplete((o, throwable) -> {
@@ -181,8 +171,10 @@ public class TraceInterceptor implements MethodInterceptor<Object, Object> {
                         }
 
                     }
-                } else {
+                }
 
+                @Override
+                protected Object interceptDefault(MethodInvocationContext<Object, Object> context) {
                     Span span = builder.start();
                     try (Scope scope = tracer.scopeManager().activate(span)) {
                         populateTags(context, hystrixCommand, span);
@@ -196,8 +188,8 @@ public class TraceInterceptor implements MethodInterceptor<Object, Object> {
                         }
                     }
                 }
-            }
 
+            }.intercept(true);
         }
     }
 

@@ -18,13 +18,10 @@ package io.micronaut.retry.intercept;
 import io.micronaut.aop.InterceptPhase;
 import io.micronaut.aop.MethodInterceptor;
 import io.micronaut.aop.MethodInvocationContext;
-import io.micronaut.aop.util.KotlinInvocationContextUtils;
+import io.micronaut.aop.util.ReactiveMethodInterceptorHelper;
 import io.micronaut.context.event.ApplicationEventPublisher;
 import io.micronaut.core.annotation.AnnotationValue;
-import io.micronaut.core.async.publisher.Publishers;
-import io.micronaut.core.convert.ConversionService;
 import io.micronaut.core.convert.value.MutableConvertibleValues;
-import io.micronaut.core.type.ReturnType;
 import io.micronaut.inject.ExecutableMethod;
 import io.micronaut.retry.RetryState;
 import io.micronaut.retry.annotation.CircuitBreaker;
@@ -32,6 +29,7 @@ import io.micronaut.retry.annotation.Retryable;
 import io.micronaut.retry.event.RetryEvent;
 import io.micronaut.scheduling.TaskExecutors;
 import io.reactivex.Flowable;
+import io.reactivex.Maybe;
 import io.reactivex.functions.Function;
 import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
@@ -71,7 +69,7 @@ public class DefaultRetryInterceptor implements MethodInterceptor<Object, Object
     /**
      * Construct a default retry method interceptor with the event publisher.
      *
-     * @param eventPublisher The event publisher to publish retry events
+     * @param eventPublisher  The event publisher to publish retry events
      * @param executorService The executor service to use for completable futures
      */
     @Inject
@@ -96,16 +94,16 @@ public class DefaultRetryInterceptor implements MethodInterceptor<Object, Object
         boolean isCircuitBreaker = context.hasStereotype(CircuitBreaker.class);
         MutableRetryState retryState;
         AnnotationRetryStateBuilder retryStateBuilder = new AnnotationRetryStateBuilder(
-            context
+                context
         );
 
         if (isCircuitBreaker) {
             long timeout = context
-                .getValue(CircuitBreaker.class, "reset", Duration.class)
-                .map(Duration::toMillis).orElse(Duration.ofSeconds(DEFAULT_CIRCUIT_BREAKER_TIMEOUT_IN_MILLIS).toMillis());
+                    .getValue(CircuitBreaker.class, "reset", Duration.class)
+                    .map(Duration::toMillis).orElse(Duration.ofSeconds(DEFAULT_CIRCUIT_BREAKER_TIMEOUT_IN_MILLIS).toMillis());
             retryState = circuitContexts.computeIfAbsent(
-                context.getExecutableMethod(),
-                method -> new CircuitBreakerRetry(timeout, retryStateBuilder, context, eventPublisher)
+                    context.getExecutableMethod(),
+                    method -> new CircuitBreakerRetry(timeout, retryStateBuilder, context, eventPublisher)
             );
         } else {
             retryState = (MutableRetryState) retryStateBuilder.build();
@@ -114,98 +112,80 @@ public class DefaultRetryInterceptor implements MethodInterceptor<Object, Object
         MutableConvertibleValues<Object> attrs = context.getAttributes();
         attrs.put(RetryState.class.getName(), retry);
 
-        ReturnType<Object> returnType = context.getReturnType();
-        Class<Object> javaReturnType = returnType.getType();
-        if (CompletionStage.class.isAssignableFrom(javaReturnType)) {
-            try {
-                retryState.open();
-            } catch (RuntimeException e) {
-                CompletableFuture newFuture = new CompletableFuture();
-                newFuture.completeExceptionally(e);
-                return newFuture;
-            }
-            Object result = context.proceed();
-            if (result == null) {
-                return result;
-            } else {
-                CompletableFuture newFuture = new CompletableFuture();
-                ((CompletableFuture<?>) result).whenComplete(retryCompletable(newFuture, context, retryState));
-                return newFuture;
-            }
-        } else if (Publishers.isConvertibleToPublisher(javaReturnType)) {
-            ConversionService<?> conversionService = ConversionService.SHARED;
-            try {
-                retryState.open();
-            } catch (RuntimeException e) {
-                Publisher result = Publishers.just(e);
-                return conversionService.convert(result, returnType.asArgument())
-                        .orElseThrow(() -> new IllegalStateException("Unconvertible Reactive type: " + result));
-            }
-            Object result = context.proceed();
-            if (result == null) {
-                return result;
-            } else {
-                Flowable observable = conversionService
-                    .convert(result, Flowable.class)
-                    .orElseThrow(() -> new IllegalStateException("Unconvertible Reactive type: " + result));
-                Flowable retryObservable = observable.onErrorResumeNext(retryFlowable(context, retryState, observable))
-                    .doOnNext(o ->
-                        retryState.close(null)
-                    );
+        return new ReactiveMethodInterceptorHelper(context) {
 
-                return conversionService
-                    .convert(retryObservable, returnType.asArgument())
-                    .orElseThrow(() -> new IllegalStateException("Unconvertible Reactive type: " + result));
+            @Override
+            protected void beforeIntercept() {
+                retryState.open();
             }
 
-        } else if (KotlinInvocationContextUtils.isKotlinCoroutine(context)) {
-            return KotlinInvocationContextUtils.handleKotlinCoroutine(context, helper -> {
-                retryState.open();
-                CompletableFuture newFuture = new CompletableFuture();
-                helper.replaceResult(newFuture);
-                helper.process().whenComplete(retryKotlinSuspend(newFuture, context, retryState));
-            });
-        } else {
-            retryState.open();
-            while (true) {
-                try {
-                    Object result = context.proceed(this);
-                    retryState.close(null);
-                    return result;
-                } catch (RuntimeException e) {
-                    if (!retryState.canRetry(e)) {
+            @Override
+            protected CompletionStage<Object> interceptCompletionStage(CompletionStage<Object> result) {
+                CompletableFuture<Object> newFuture = new CompletableFuture<>();
+                result.whenComplete(retryCompletable(newFuture));
+                return newFuture;
+            }
+
+            @Override
+            protected Publisher<Object> interceptPublisher(Publisher<Object> publisher) {
+                Flowable<Object> flowable = Flowable.fromPublisher(publisher);
+                return flowable.onErrorResumeNext(retryFlowable(context, retryState, flowable))
+                        .doOnNext(o -> retryState.close(null));
+            }
+
+            @Override
+            protected Object interceptDefault(MethodInvocationContext<Object, Object> context) {
+                Flowable<Object> flowable = Flowable.defer(() -> Maybe.fromCallable(context::proceed).toFlowable())
+                        .doOnNext(o -> retryState.close(null));
+                Flowable<Object> flowableRetry = Flowable.defer(() -> Maybe.fromCallable(() -> context.proceed(DefaultRetryInterceptor.this)).toFlowable())
+                        .doOnNext(o -> retryState.close(null));
+                Flowable<Object> flowableResult = flowable.onErrorResumeNext(retryFlowable(context, retryState, flowableRetry));
+                return flowableResult.singleElement().map(Optional::of).toSingle(Optional.empty()).blockingGet().orElse(null);
+            }
+
+            private BiConsumer<Object, ? super Throwable> retryCompletable(CompletableFuture<Object> newFuture) {
+                return (Object value, Throwable exception) -> {
+                    if (exception == null) {
+                        retryState.close(null);
+                        newFuture.complete(value);
+                        return;
+                    }
+                    if (retryState.canRetry(exception)) {
+                        long delay = retryState.nextDelay();
+                        if (eventPublisher != null) {
+                            try {
+                                eventPublisher.publishEvent(new RetryEvent(context, retryState, exception));
+                            } catch (Exception e) {
+                                LOG.error("Error occurred publishing RetryEvent: " + e.getMessage(), e);
+                            }
+                        }
+                        executorService.schedule(() -> {
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug("Retrying execution for method [{}] after delay of {}ms for exception: {}",
+                                        context,
+                                        delay,
+                                        (exception).getMessage());
+                            }
+                            proceedAsCompletionStage(DefaultRetryInterceptor.this).whenComplete(retryCompletable(newFuture));
+
+                        }, delay, TimeUnit.MILLISECONDS);
+                    } else {
                         if (LOG.isDebugEnabled()) {
                             LOG.debug("Cannot retry anymore. Rethrowing original exception for method: {}", context);
                         }
-                        retryState.close(e);
-                        throw e;
-                    } else {
-                        long delayMillis = retryState.nextDelay();
-                        try {
-                            if (eventPublisher != null) {
-                                try {
-                                    eventPublisher.publishEvent(new RetryEvent(context, retryState, e));
-                                } catch (Exception e1) {
-                                    LOG.error("Error occurred publishing RetryEvent: " + e1.getMessage(), e1);
-                                }
-                            }
-                            if (LOG.isDebugEnabled()) {
-                                LOG.debug("Retrying execution for method [{}] after delay of {}ms for exception: {}", context, delayMillis, e.getMessage());
-                            }
-                            Thread.sleep(delayMillis);
-                        } catch (InterruptedException e1) {
-                            throw e;
-                        }
+                        retryState.close(exception);
+                        newFuture.completeExceptionally(exception);
                     }
-                }
+                };
+
             }
-        }
+
+        }.intercept();
     }
 
     @SuppressWarnings("unchecked")
-    private Function retryFlowable(MethodInvocationContext<Object, Object> context, MutableRetryState retryState, Flowable observable) {
-        return throwable -> {
-            Throwable exception = (Throwable) throwable;
+    private <T> Function<? super Throwable, ? extends Publisher<? extends T>> retryFlowable(MethodInvocationContext<Object, Object> context, MutableRetryState retryState, Flowable<Object> observable) {
+        return exception -> {
             if (retryState.canRetry(exception)) {
                 Flowable retryObservable = observable.onErrorResumeNext(retryFlowable(context, retryState, observable));
                 long delay = retryState.nextDelay();
@@ -217,10 +197,7 @@ public class DefaultRetryInterceptor implements MethodInterceptor<Object, Object
                     }
                 }
                 if (LOG.isDebugEnabled()) {
-                    LOG.debug("Retrying execution for method [{}] after delay of {}ms for exception: {}",
-                        context,
-                        delay,
-                        (exception).getMessage());
+                    LOG.debug("Retrying execution for method [{}] after delay of {}ms for exception: {}", context, delay, exception.getMessage(), exception);
                 }
                 return retryObservable.delaySubscription(delay, TimeUnit.MILLISECONDS);
             } else {
@@ -233,78 +210,4 @@ public class DefaultRetryInterceptor implements MethodInterceptor<Object, Object
         };
     }
 
-    private BiConsumer<Object, ? super Throwable> retryCompletable(CompletableFuture<Object> newFuture, MethodInvocationContext<Object, Object> context, MutableRetryState retryState) {
-        return (Object value, Throwable exception) -> {
-            if (exception == null) {
-                retryState.close(null);
-                newFuture.complete(value);
-                return;
-            }
-            if (retryState.canRetry(exception)) {
-                long delay = retryState.nextDelay();
-                if (eventPublisher != null) {
-                    try {
-                        eventPublisher.publishEvent(new RetryEvent(context, retryState, exception));
-                    } catch (Exception e) {
-                        LOG.error("Error occurred publishing RetryEvent: " + e.getMessage(), e);
-                    }
-                }
-                executorService.schedule(() -> {
-                    if (LOG.isDebugEnabled()) {
-                        LOG.debug("Retrying execution for method [{}] after delay of {}ms for exception: {}",
-                                context,
-                                delay,
-                                (exception).getMessage());
-                    }
-                    Object retryResult = context.proceed(this);
-                    ((CompletableFuture<?>) retryResult).whenComplete(retryCompletable(newFuture, context, retryState));
-
-                }, delay, TimeUnit.MILLISECONDS);
-            } else {
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("Cannot retry anymore. Rethrowing original exception for method: {}", context);
-                }
-                retryState.close(exception);
-                newFuture.completeExceptionally(exception);
-            }
-        };
-
-    }
-
-    private BiConsumer<Object, ? super Throwable> retryKotlinSuspend(CompletableFuture<Object> newFuture, MethodInvocationContext<Object, Object> context, MutableRetryState retryState) {
-        return (Object value, Throwable exception) -> {
-            if (exception == null) {
-                retryState.close(null);
-                newFuture.complete(value);
-                return;
-            }
-            if (retryState.canRetry(exception)) {
-                long delay = retryState.nextDelay();
-                if (eventPublisher != null) {
-                    try {
-                        eventPublisher.publishEvent(new RetryEvent(context, retryState, exception));
-                    } catch (Exception e) {
-                        LOG.error("Error occurred publishing RetryEvent: " + e.getMessage(), e);
-                    }
-                }
-                executorService.schedule(() -> {
-                    if (LOG.isDebugEnabled()) {
-                        LOG.debug("Retrying execution for method [{}] after delay of {}ms for exception: {}",
-                                context,
-                                delay,
-                                (exception).getMessage());
-                    }
-                    KotlinInvocationContextUtils.handleKotlinCoroutine(context, helper -> {
-                        helper.process(this).whenComplete(retryKotlinSuspend(newFuture, context, retryState));
-                    });
-                }, delay, TimeUnit.MILLISECONDS);
-            } else {
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("Cannot retry anymore. Rethrowing original exception for method: {}", context);
-                }
-                retryState.close(exception);
-                newFuture.completeExceptionally(exception);
-            }
-        };
-    }
 }

@@ -18,9 +18,9 @@ package io.micronaut.scheduling.async;
 import io.micronaut.aop.InterceptPhase;
 import io.micronaut.aop.MethodInterceptor;
 import io.micronaut.aop.MethodInvocationContext;
+import io.micronaut.aop.util.ReactiveMethodInterceptorHelper;
 import io.micronaut.context.BeanLocator;
 import io.micronaut.core.annotation.Internal;
-import io.micronaut.core.async.publisher.Publishers;
 import io.micronaut.core.type.ReturnType;
 import io.micronaut.inject.qualifiers.Qualifiers;
 import io.micronaut.scheduling.TaskExecutors;
@@ -28,6 +28,7 @@ import io.micronaut.scheduling.annotation.Async;
 import io.micronaut.scheduling.exceptions.TaskExecutionException;
 import io.reactivex.Flowable;
 import io.reactivex.schedulers.Schedulers;
+import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,8 +41,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
 import java.util.function.BiConsumer;
+import java.util.function.Supplier;
 
 /**
  * Interceptor implementation for the {@link Async} annotation.
@@ -61,7 +62,7 @@ public class AsyncInterceptor implements MethodInterceptor<Object, Object> {
     /**
      * Default constructor.
      *
-     * @param beanLocator The bean constructor
+     * @param beanLocator              The bean constructor
      * @param scheduledExecutorService The scheduled executor service
      */
     AsyncInterceptor(BeanLocator beanLocator, @Named(TaskExecutors.SCHEDULED) Optional<Provider<ExecutorService>> scheduledExecutorService) {
@@ -86,44 +87,52 @@ public class AsyncInterceptor implements MethodInterceptor<Object, Object> {
                             .orElseThrow(() -> new TaskExecutionException("No ExecutorService named [" + name + "] configured in application context")));
         }
 
-        ReturnType<Object> rt = context.getReturnType();
-        Class<?> returnType = rt.getType();
-        if (CompletionStage.class.isAssignableFrom(returnType) || Future.class.isAssignableFrom(returnType)) {
-            CompletableFuture newFuture = new CompletableFuture();
+        return new ReactiveMethodInterceptorHelper(context) {
 
-            executorService.submit(() -> {
-                CompletionStage<?> completionStage = (CompletionStage) context.proceed();
-                if (completionStage == null) {
-                    newFuture.complete(null);
-                } else {
-                    completionStage.whenComplete((BiConsumer<Object, Throwable>) (o, throwable) -> {
-                        if (throwable != null) {
-                            newFuture.completeExceptionally(throwable);
-                        } else {
-                            newFuture.complete(o);
+            @Override
+            protected CompletionStage<Object> lazyInterceptCompletionStage(Supplier<CompletionStage<Object>> resultSupplier) {
+                CompletableFuture<Object> newFuture = new CompletableFuture<>();
+                executorService.submit(() -> {
+                    CompletionStage<?> completionStage = resultSupplier.get();
+                    if (completionStage == null) {
+                        newFuture.complete(null);
+                    } else {
+                        completionStage.whenComplete((BiConsumer<Object, Throwable>) (o, throwable) -> {
+                            if (throwable != null) {
+                                newFuture.completeExceptionally(throwable);
+                            } else {
+                                newFuture.complete(o);
+                            }
+                        });
+                    }
+                });
+                return newFuture;
+            }
+
+            @Override
+            protected Publisher<Object> interceptPublisher(Publisher<Object> publisher) {
+                return Flowable.fromPublisher(publisher).subscribeOn(Schedulers.from(executorService));
+            }
+
+            @Override
+            protected Object interceptDefault(MethodInvocationContext<Object, Object> context) {
+                ReturnType<Object> rt = context.getReturnType();
+                Class<?> returnType = rt.getType();
+                if (void.class == returnType) {
+                    executorService.submit(() -> {
+                        try {
+                            context.proceed();
+                        } catch (Throwable e) {
+                            if (LOG.isErrorEnabled()) {
+                                LOG.error("Error occurred executing @Async method [" + context.getExecutableMethod() + "]: " + e.getMessage(), e);
+                            }
                         }
                     });
+                    return null;
                 }
-            });
-            return newFuture;
-        } else if (void.class == returnType) {
-            executorService.submit(() -> {
-                try {
-                    context.proceed();
-                } catch (Throwable e) {
-                    if (LOG.isErrorEnabled()) {
-                        LOG.error("Error occurred executing @Async method [" + context.getExecutableMethod() + "]: " + e.getMessage(), e);
-                    }
-                }
-            });
-            return null;
-        } else if (Publishers.isConvertibleToPublisher(returnType)) {
-            Object result = context.proceed();
-            Flowable<?> flowable = Publishers.convertPublisher(result, Flowable.class);
-            flowable = flowable.subscribeOn(Schedulers.from(executorService));
-            return Publishers.convertPublisher(flowable, returnType);
-        } else {
-            throw new TaskExecutionException("Method [" + context.getExecutableMethod() + "] must return either void, or an instance of Publisher or CompletionStage");
-        }
+                throw new TaskExecutionException("Method [" + context.getExecutableMethod() + "] must return either void, or an instance of Publisher or CompletionStage");
+            }
+
+        }.intercept(true);
     }
 }

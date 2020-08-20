@@ -54,4 +54,10 @@ class CompletableFutureContinuation(private val continuation: Continuation<Any>)
         continuation.resumeWith(Result.failure(exception))
     }
 
+    companion object {
+        fun completeExceptionally(continuation: Continuation<Any>, exception: Throwable) {
+            continuation.resumeWith(Result.failure(exception))
+        }
+    }
+
 }

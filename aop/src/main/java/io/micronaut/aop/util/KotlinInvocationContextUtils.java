@@ -83,7 +83,7 @@ public class KotlinInvocationContextUtils {
             CompletableFuture<Object> completableFuture = completableFutureContinuation.getCompletableFuture();
             consumer.accept(new KotlinCoroutineInvocation() {
                 @Override
-                public CompletionStage process(Interceptor interceptor) {
+                public CompletionStage<Object> process(Interceptor interceptor) {
                     Object result = context.proceed(interceptor);
                     if (result != KotlinUtils.COROUTINE_SUSPENDED) {
                         throw new IllegalStateException("Not a Kotlin coroutine");
@@ -92,7 +92,7 @@ public class KotlinInvocationContextUtils {
                 }
 
                 @Override
-                public CompletionStage process() {
+                public CompletionStage<Object> process() {
                     Object result = context.proceed();
                     if (result != KotlinUtils.COROUTINE_SUSPENDED) {
                         throw new IllegalStateException("Not a Kotlin coroutine");
@@ -101,7 +101,7 @@ public class KotlinInvocationContextUtils {
                 }
 
                 @Override
-                public void replaceResult(CompletionStage newResult) {
+                public void replaceResult(CompletionStage<Object> newResult) {
                     newResult.whenComplete((result, throwable) -> {
                         if (throwable == null) {
                             completableFutureContinuation.continuationComplete(result);
@@ -111,6 +111,21 @@ public class KotlinInvocationContextUtils {
                     });
                 }
             });
+            return KotlinUtils.COROUTINE_SUSPENDED;
+        }
+        throw new IllegalStateException("Expected Kotlin Continuation got: " + lastArgumentValue);
+    }
+
+    public static Object completeExceptionallyKotlinCoroutine(MethodInvocationContext<Object, Object> context, Throwable throwable) {
+        Object[] parameterValues = context.getParameterValues();
+        if (parameterValues.length == 0) {
+            throw new IllegalStateException("Expected at least one parameter");
+        }
+        int lastParameterIndex = parameterValues.length - 1;
+        Object lastArgumentValue = parameterValues[lastParameterIndex];
+        if (lastArgumentValue instanceof Continuation) {
+            Continuation<Object> continuation = (Continuation) lastArgumentValue;
+            CompletableFutureContinuation.Companion.completeExceptionally(continuation, throwable);
             return KotlinUtils.COROUTINE_SUSPENDED;
         }
         throw new IllegalStateException("Expected Kotlin Continuation got: " + lastArgumentValue);
@@ -126,7 +141,7 @@ public class KotlinInvocationContextUtils {
          *
          * @return The {@link CompletionStage}
          */
-        CompletionStage process();
+        CompletionStage<Object> process();
 
         /**
          * Proceeds with the invocation using the given interceptor as a position to start ({@link io.micronaut.aop.InvocationContext}). Returns {@link CompletionStage} representing a coroutine call.
@@ -134,14 +149,14 @@ public class KotlinInvocationContextUtils {
          * @param from The interceptor to start from (note: will not be included in the execution)
          * @return The {@link CompletionStage}
          */
-        CompletionStage process(Interceptor from);
+        CompletionStage<Object> process(Interceptor from);
 
         /**
          * Replaces the coroutine result.
          *
          * @param newResult new result represented by {@link CompletableFuture}
          */
-        void replaceResult(CompletionStage newResult);
+        void replaceResult(CompletionStage<Object> newResult);
 
     }
 
