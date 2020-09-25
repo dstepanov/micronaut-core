@@ -25,6 +25,7 @@ import io.micronaut.http.client.exceptions.HttpClientResponseException
 import io.micronaut.http.client.multipart.MultipartBody
 import io.reactivex.Flowable
 import spock.lang.IgnoreIf
+import spock.lang.Unroll
 
 /**
  * @author Graeme Rocher
@@ -309,6 +310,32 @@ class UploadSpec extends AbstractMicronautSpec {
         then:
         response.code() == HttpStatus.OK.code
         result == 'data.json: 16'
+    }
+
+    @Unroll
+    void "test upload different receive #path"(String path) {
+        given:
+        def data = '{"title":"Test"}'
+        MultipartBody requestBody = MultipartBody.builder()
+                .addPart("data", "data.json", MediaType.APPLICATION_JSON_TYPE, data.bytes)
+                .build()
+
+        when:
+        Flowable<HttpResponse<String>> flowable = Flowable.fromPublisher(client.exchange(
+                HttpRequest.POST("/upload/$path", requestBody)
+                        .contentType(MediaType.MULTIPART_FORM_DATA_TYPE)
+                        .accept(MediaType.TEXT_PLAIN_TYPE),
+                String
+        ))
+        HttpResponse<String> response = flowable.blockingFirst()
+        def result = response.getBody().get()
+
+        then:
+        response.code() == HttpStatus.OK.code
+        result == 'OK'
+
+        where:
+            path << ["receive-multipart-body-blocking", "receive-multipart-body-as-single"]
     }
 
 }

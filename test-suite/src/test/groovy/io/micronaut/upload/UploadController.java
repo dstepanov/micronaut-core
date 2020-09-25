@@ -386,6 +386,17 @@ public class UploadController {
         });
     }
 
+    @Post(value =  "/receive-multipart-body-blocking", consumes = MediaType.MULTIPART_FORM_DATA, produces = MediaType.TEXT_PLAIN)
+    String multipartBlocking(@Body MultipartBody multipartBody) throws IOException {
+        CompletedPart completedPart = Flowable.fromPublisher(multipartBody).blockingSingle();
+        return completedPart.getBytes() == null ? "FAIL" : "OK";
+    }
+
+    @Post(uri = "/receive-multipart-body-as-single", consumes = MediaType.MULTIPART_FORM_DATA, produces = MediaType.TEXT_PLAIN)
+    Single<String> multipartAsSingle(@Body io.micronaut.http.server.multipart.MultipartBody body) {
+        return Single.fromPublisher(body).map(single -> single.getBytes() == null ? "FAIL" : "OK");
+    }
+
     public static class Data {
         String title;
 
