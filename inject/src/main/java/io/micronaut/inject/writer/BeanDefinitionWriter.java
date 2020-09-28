@@ -48,6 +48,7 @@ import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  * <p>Responsible for building {@link BeanDefinition} instances at compile time. Uses ASM build the class definition.</p>
@@ -195,6 +196,8 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
     private Map<String, Map<String, Object>> typeArguments;
     private List<MethodVisitData> postConstructMethodVisits = new ArrayList<>(2);
     private List<MethodVisitData> preDestroyMethodVisits = new ArrayList<>(2);
+
+    private List<Runnable> deferredInjectionPoints = new ArrayList<>();
 
     /**
      * Creates a bean definition writer.
@@ -505,6 +508,10 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
             requiresMethodProcessing.visitInsn(IRETURN);
             requiresMethodProcessing.visitMaxs(1, 1);
             requiresMethodProcessing.visitEnd();
+        }
+
+        for (Runnable fieldInjectionPoint : deferredInjectionPoints) {
+            fieldInjectionPoint.run();
         }
 
         constructorVisitor.visitInsn(RETURN);
@@ -868,6 +875,54 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
                                                         boolean isInterface,
                                                         boolean isDefault) {
 
+        return visitExecutableMethod(
+                declaringType,
+                returnType,
+                genericReturnType,
+                returnTypeGenericTypes,
+                methodName,
+                argumentTypes,
+                genericArgumentTypes,
+                argumentAnnotationMetadata,
+                genericTypes,
+                annotationMetadata,
+                isInterface,
+                false,
+                isDefault,
+                null, null);
+    }
+
+    private final Set<String> addedExecutableMethods = new HashSet<>();
+
+    public ExecutableMethodWriter visitExecutableMethod(Object declaringType,
+                                                        Object returnType,
+                                                        Object genericReturnType,
+                                                        Map<String, Object> returnTypeGenericTypes,
+                                                        String methodName,
+                                                        Map<String, Object> argumentTypes,
+                                                        Map<String, Object> genericArgumentTypes,
+                                                        Map<String, AnnotationMetadata> argumentAnnotationMetadata,
+                                                        Map<String, Map<String, Object>> genericTypes,
+                                                        AnnotationMetadata annotationMetadata,
+                                                        boolean isInterface,
+                                                        boolean isAbstract,
+                                                        boolean isDefault,
+                                                        String interceptedProxyClassName,
+                                                        String interceptedProxyBridgeMethodName) {
+
+
+        String methodKey = new StringBuilder(methodName)
+                .append("(")
+                .append(argumentTypes.values().stream()
+                        .map(Object::toString)
+                        .collect(Collectors.joining(",")))
+                .append(")")
+                .toString();
+
+        if (methodExecutors.containsKey(methodKey)) {
+            return methodExecutors.get(methodKey);
+        }
+
         DefaultAnnotationMetadata.contributeDefaults(
                 this.annotationMetadata,
                 annotationMetadata
@@ -896,11 +951,15 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
                 methodExecutorClassName,
                 methodProxyShortName,
                 this.isInterface || isInterface,
+                isAbstract,
                 isDefault,
                 isSuspend,
                 getOriginatingElement(),
-                annotationMetadata
+                annotationMetadata,
+                interceptedProxyClassName,
+                interceptedProxyBridgeMethodName
         );
+
 //        executableMethodWriter.makeStaticInner(beanDefinitionInternalName, (ClassWriter) classWriter);
         executableMethodWriter.visitMethod(
                 declaringType,
@@ -914,23 +973,28 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
                 genericTypes
         );
 
-        methodExecutors.put(methodExecutorClassName, executableMethodWriter);
+        methodExecutors.put(methodKey, executableMethodWriter);
 
-        if (constructorVisitor == null) {
-            throw new IllegalStateException("Method visitBeanDefinitionConstructor(..) should be called first!");
-        }
+        deferredInjectionPoints.add(() -> {
 
-        constructorVisitor.visitVarInsn(ALOAD, 0);
-        String methodExecutorInternalName = executableMethodWriter.getInternalName();
-        constructorVisitor.visitTypeInsn(NEW, methodExecutorInternalName);
-        constructorVisitor.visitInsn(DUP);
-        constructorVisitor.visitMethodInsn(INVOKESPECIAL,
-                methodExecutorInternalName,
-                CONSTRUCTOR_NAME,
-                DESCRIPTOR_DEFAULT_CONSTRUCTOR,
-                false);
+            if (constructorVisitor == null) {
+                throw new IllegalStateException("Method visitBeanDefinitionConstructor(..) should be called first!");
+            }
 
-        pushInvokeMethodOnSuperClass(constructorVisitor, ADD_EXECUTABLE_METHOD);
+            constructorVisitor.visitVarInsn(ALOAD, 0);
+            String methodExecutorInternalName = executableMethodWriter.getInternalName();
+            constructorVisitor.visitTypeInsn(NEW, methodExecutorInternalName);
+            constructorVisitor.visitInsn(DUP);
+            constructorVisitor.visitMethodInsn(INVOKESPECIAL,
+                    methodExecutorInternalName,
+                    CONSTRUCTOR_NAME,
+                    DESCRIPTOR_DEFAULT_CONSTRUCTOR,
+                    false);
+
+            pushInvokeMethodOnSuperClass(constructorVisitor, ADD_EXECUTABLE_METHOD);
+
+        });
+
         return executableMethodWriter;
     }
 

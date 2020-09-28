@@ -719,23 +719,6 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
                         aopProxyWriter.visitInterceptorTypes(interceptorTypes);
                     }
 
-
-                    if (annotationMetadata.hasStereotype(Executable.class)) {
-                        aopProxyWriter.visitExecutableMethod(
-                                owningType,
-                                returnType,
-                                resolvedReturnType,
-                                returnTypeGenerics,
-                                methodName,
-                                methodParameters,
-                                genericParameters,
-                                parameterAnnotationMetadata,
-                                methodGenericTypes,
-                                annotationMetadata,
-                                JavaModelUtils.isInterface(method.getEnclosingElement()),
-                                method.isDefault()
-                        );
-                    }
                     if (isAbstract) {
                         aopProxyWriter.visitIntroductionMethod(
                                 owningType,
@@ -1263,29 +1246,11 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
                 typeRef = modelUtils.resolveTypeReference(concreteClass);
             }
 
-            final AopProxyWriter proxyWriter = resolveAopWriter(beanWriter);
-            ExecutableMethodWriter executableMethodWriter = null;
-            if (proxyWriter == null || proxyWriter.isProxyTarget()) {
-                executableMethodWriter = beanWriter.visitExecutableMethod(
-                        typeRef,
-                        resolvedReturnType,
-                        resolvedReturnType,
-                        returnTypeGenerics,
-                        method.getSimpleName().toString(),
-                        params.getParameters(),
-                        params.getGenericParameters(),
-                        params.getParameterMetadata(),
-                        params.getGenericTypes(),
-                        methodAnnotationMetadata,
-                        JavaModelUtils.isInterface(enclosingElement),
-                        method.isDefault());
-            }
-
-
             if (methodAnnotationMetadata.hasStereotype(Adapter.class)) {
                 visitAdaptedMethod(method, methodAnnotationMetadata);
             }
 
+            boolean executableMethodVisited = false;
 
             // shouldn't visit around advice on an introduction advice instance
             if (!(beanWriter instanceof AopProxyWriter)) {
@@ -1309,18 +1274,11 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
 
                     aopProxyWriter.visitInterceptorTypes(interceptorTypes);
 
-                    boolean isAnnotationReference = methodAnnotationMetadata instanceof AnnotationMetadataReference;
-
                     AnnotationMetadata aroundMethodMetadata;
-
-                    if (!isAnnotationReference && executableMethodWriter != null) {
-                        aroundMethodMetadata = new AnnotationMetadataReference(executableMethodWriter.getClassName(), methodAnnotationMetadata);
+                    if (methodAnnotationMetadata instanceof AnnotationMetadataHierarchy) {
+                        aroundMethodMetadata = methodAnnotationMetadata;
                     } else {
-                        if (methodAnnotationMetadata instanceof AnnotationMetadataHierarchy) {
-                            aroundMethodMetadata = methodAnnotationMetadata;
-                        } else {
-                            aroundMethodMetadata = new AnnotationMetadataHierarchy(concreteClassMetadata, methodAnnotationMetadata);
-                        }
+                        aroundMethodMetadata = new AnnotationMetadataHierarchy(concreteClassMetadata, methodAnnotationMetadata);
                     }
 
                     if (modelUtils.isFinal(method)) {
@@ -1328,42 +1286,26 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
                             error(method, "Method defines AOP advice but is declared final. Change the method to be non-final in order for AOP advice to be applied.");
                         } else {
                             if (isAopProxyType && isPublic && !declaringClass.equals(concreteClass)) {
-                                if (executableMethodWriter == null) {
-                                    beanWriter.visitExecutableMethod(
-                                            typeRef,
-                                            resolvedReturnType,
-                                            resolvedReturnType,
-                                            returnTypeGenerics,
-                                            method.getSimpleName().toString(),
-                                            params.getParameters(),
-                                            params.getGenericParameters(),
-                                            params.getParameterMetadata(),
-                                            params.getGenericTypes(),
-                                            methodAnnotationMetadata,
-                                            JavaModelUtils.isInterface(enclosingElement),
-                                            method.isDefault());
-                                }
+                                beanWriter.visitExecutableMethod(
+                                        typeRef,
+                                        resolvedReturnType,
+                                        resolvedReturnType,
+                                        returnTypeGenerics,
+                                        method.getSimpleName().toString(),
+                                        params.getParameters(),
+                                        params.getGenericParameters(),
+                                        params.getParameterMetadata(),
+                                        params.getGenericTypes(),
+                                        aroundMethodMetadata,
+                                        JavaModelUtils.isInterface(enclosingElement),
+                                        method.isDefault());
+                                executableMethodVisited = true;
                             } else {
                                 error(method, "Public method inherits AOP advice but is declared final. Either make the method non-public or apply AOP advice only to public methods declared on the class.");
                             }
                         }
                     } else {
-                        if (aroundMethodMetadata.hasStereotype(Executable.class)) {
-                            aopProxyWriter.visitExecutableMethod(
-                                    typeRef,
-                                    resolvedReturnType,
-                                    resolvedReturnType,
-                                    returnTypeGenerics,
-                                    method.getSimpleName().toString(),
-                                    params.getParameters(),
-                                    params.getGenericParameters(),
-                                    params.getParameterMetadata(),
-                                    params.getGenericTypes(),
-                                    aroundMethodMetadata,
-                                    JavaModelUtils.isInterface(enclosingElement),
-                                    method.isDefault()
-                            );
-                        }
+
                         aopProxyWriter.visitAroundMethod(
                                 typeRef,
                                 resolvedReturnType,
@@ -1377,24 +1319,28 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
                                 aroundMethodMetadata,
                                 JavaModelUtils.isInterface(enclosingElement),
                                 method.isDefault());
+                        executableMethodVisited = true;
                     }
 
-                } else if (executableMethodWriter == null) {
-                    beanWriter.visitExecutableMethod(
-                            typeRef,
-                            resolvedReturnType,
-                            resolvedReturnType,
-                            returnTypeGenerics,
-                            method.getSimpleName().toString(),
-                            params.getParameters(),
-                            params.getGenericParameters(),
-                            params.getParameterMetadata(),
-                            params.getGenericTypes(),
-                            methodAnnotationMetadata,
-                            JavaModelUtils.isInterface(enclosingElement),
-                            method.isDefault());
                 }
             }
+
+            if (!executableMethodVisited) {
+                 beanWriter.visitExecutableMethod(
+                        typeRef,
+                        resolvedReturnType,
+                        resolvedReturnType,
+                        returnTypeGenerics,
+                        method.getSimpleName().toString(),
+                        params.getParameters(),
+                        params.getGenericParameters(),
+                        params.getParameterMetadata(),
+                        params.getGenericTypes(),
+                        methodAnnotationMetadata,
+                        JavaModelUtils.isInterface(enclosingElement),
+                        method.isDefault());
+            }
+
         }
 
         private void visitAdaptedMethod(ExecutableElement method, AnnotationMetadata methodAnnotationMetadata) {
@@ -1582,10 +1528,9 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
                                             methodQualifier,
                                             methodGenericTypes,
                                             annotationMetadata,
-                                            JavaModelUtils.isInterface(method.getEnclosingElement()),
-                                            method.isDefault()
+                                            JavaModelUtils.isInterface(targetMethod.getEnclosingElement()),
+                                            targetMethod.isDefault()
                                     );
-
 
                                 } else {
                                     error(method, "Cannot adapt method [" + method + "] to target method [" + targetMethod + "]. Argument lengths don't match.");
@@ -2146,6 +2091,10 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
                     .toArray();
 
             String[] interfaceTypes = annotationMetadata.getValue(Introduction.class, "interfaces", String[].class).orElse(new String[0]);
+
+            System.out.println("XXX " + packageElement);
+            System.out.println("XXX " + beanClassName);
+            System.out.println("XXX " + originatingElement.getName());
 
             Object[] interceptorTypes = ArrayUtils.concat(aroundInterceptors, introductionInterceptors);
             boolean isInterface = JavaModelUtils.isInterface(typeElement);

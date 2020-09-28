@@ -25,6 +25,7 @@ import io.micronaut.inject.annotation.AnnotationMetadataReference;
 import io.micronaut.inject.annotation.DefaultAnnotationMetadata;
 import io.micronaut.inject.ast.Element;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
@@ -75,6 +76,8 @@ public class ExecutableMethodWriter extends AbstractAnnotationMetadataWriter imp
     private final boolean isDefault;
     private String outerClassName = null;
     private boolean isStatic = false;
+    private String interceptedProxyClassName;
+    private String interceptedProxyBridgeMethodName;
 
     /**
      * @param beanFullClassName    The bean full class name
@@ -94,18 +97,20 @@ public class ExecutableMethodWriter extends AbstractAnnotationMetadataWriter imp
             boolean isDefault,
             boolean isSuspend,
             Element originatingElement,
-            AnnotationMetadata annotationMetadata) {
-        super(methodClassName, originatingElement, annotationMetadata, true);
-        this.classWriter = new ClassWriter(ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES);
-        this.beanFullClassName = beanFullClassName;
-        this.methodProxyShortName = methodProxyShortName;
-        this.className = methodClassName;
-        this.internalName = getInternalName(methodClassName);
-        this.methodType = getObjectType(methodClassName);
-        this.isInterface = isInterface;
-        this.isAbstract = !isInterface || !isDefault;
-        this.isDefault = isDefault;
-        this.isSuspend = isSuspend;
+            AnnotationMetadata annotationMetadata,
+            String interceptedProxyClassName,
+            String interceptedProxyBridgeMethodName) {
+        this(beanFullClassName,
+                methodClassName,
+                methodProxyShortName,
+                isInterface,
+                !isInterface || !isDefault,
+                isDefault,
+                isSuspend,
+                originatingElement,
+                annotationMetadata,
+                interceptedProxyClassName,
+                interceptedProxyBridgeMethodName);
     }
 
     /**
@@ -128,7 +133,9 @@ public class ExecutableMethodWriter extends AbstractAnnotationMetadataWriter imp
             boolean isDefault,
             boolean isSuspend,
             Element originatingElement,
-            AnnotationMetadata annotationMetadata) {
+            AnnotationMetadata annotationMetadata,
+            String interceptedProxyClassName,
+            String interceptedProxyBridgeMethodName) {
         super(methodClassName, originatingElement, annotationMetadata, true);
         this.classWriter = new ClassWriter(ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES);
         this.beanFullClassName = beanFullClassName;
@@ -140,6 +147,8 @@ public class ExecutableMethodWriter extends AbstractAnnotationMetadataWriter imp
         this.isAbstract = isAbstract;
         this.isDefault = isDefault;
         this.isSuspend = isSuspend;
+        this.interceptedProxyClassName = interceptedProxyClassName;
+        this.interceptedProxyBridgeMethodName = interceptedProxyBridgeMethodName;
     }
 
     /**
@@ -419,7 +428,58 @@ public class ExecutableMethodWriter extends AbstractAnnotationMetadataWriter imp
             Collection<Object> argumentTypes,
             GeneratorAdapter invokeMethodVisitor) {
         Type returnTypeObject = getTypeReference(returnType);
+
+        // load this
         invokeMethodVisitor.visitVarInsn(ALOAD, 1);
+        // duplicate value
+        invokeMethodVisitor.dup();
+
+        if (interceptedProxyClassName != null) {
+            String bridgeDesc = getMethodDescriptor(returnType, argumentTypes);
+
+            Label invokeTargetBlock = new Label();
+
+            invokeMethodVisitor.dup();
+
+            Type objectType = getObjectType(interceptedProxyClassName);
+
+            invokeMethodVisitor.instanceOf(objectType);
+
+            invokeMethodVisitor.push(true);
+            // compare parent == target
+            invokeMethodVisitor.ifCmp(Type.BOOLEAN_TYPE, GeneratorAdapter.NE, invokeTargetBlock);
+
+            // Invoke method on the static parent field
+
+            pushCastToType(invokeMethodVisitor,  objectType.getClassName());
+
+            // load arguments
+            Iterator<Object> iterator = argumentTypes.iterator();
+            for (int i = 0; i < argumentTypes.size(); i++) {
+                invokeMethodVisitor.loadArg(1);
+                invokeMethodVisitor.push(i);
+                invokeMethodVisitor.visitInsn(AALOAD);
+
+                pushCastToType(invokeMethodVisitor, iterator.next());
+            }
+
+            invokeMethodVisitor.visitMethodInsn(INVOKEVIRTUAL,
+                    objectType.getInternalName(), interceptedProxyBridgeMethodName,
+                    getMethodDescriptor(returnType, argumentTypes), isInterface);
+
+            if (returnTypeObject.equals(Type.VOID_TYPE)) {
+                invokeMethodVisitor.visitInsn(ACONST_NULL);
+            } else {
+                pushBoxPrimitiveIfNecessary(returnType, invokeMethodVisitor);
+            }
+            invokeMethodVisitor.visitInsn(ARETURN);
+
+            invokeMethodVisitor.visitLabel(invokeTargetBlock);
+
+            // remove parent
+            invokeMethodVisitor.pop();
+        }
+
         pushCastToType(invokeMethodVisitor,  declaringTypeObject.getClassName());
         boolean hasArgs = !argumentTypes.isEmpty();
         String methodDescriptor;

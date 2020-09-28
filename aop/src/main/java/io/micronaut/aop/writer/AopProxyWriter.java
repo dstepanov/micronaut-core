@@ -33,7 +33,6 @@ import io.micronaut.core.annotation.AnnotationMetadata;
 import io.micronaut.core.naming.NameUtils;
 import io.micronaut.core.reflect.ReflectionUtils;
 import io.micronaut.core.util.ArrayUtils;
-import io.micronaut.core.util.CollectionUtils;
 import io.micronaut.core.value.OptionalValues;
 import io.micronaut.inject.BeanDefinition;
 import io.micronaut.inject.ExecutableMethod;
@@ -509,6 +508,9 @@ public class AopProxyWriter extends AbstractClassFileWriter implements ProxyingB
                                    boolean isInterface) {
 
         boolean interfaceMethod = isInterface || this.isInterface;
+        if (isInterface) {
+            isAbstract = true;
+        }
 
         List<Object> argumentTypeList = new ArrayList<>(argumentTypes.values());
         int argumentCount = argumentTypes.size();
@@ -517,107 +519,42 @@ public class AopProxyWriter extends AbstractClassFileWriter implements ProxyingB
         boolean isVoidReturn = isPrimitive && returnTypeObject.equals(Type.VOID_TYPE);
         final Type declaringTypeReference = getTypeReference(declaringType);
         MethodRef methodKey = new MethodRef(methodName, argumentTypeList, returnTypeObject);
-        if (isProxyTarget) {
-            // if the target class is being proxied then the method will be looked up from the parent bean definition.
-            // Therefore no need to generate a bridge
-            if (!proxyTargetMethods.contains(methodKey)) {
-                int index = proxyMethodCount++;
-                proxyTargetMethods.add(methodKey);
-                buildMethodOverride(returnType, methodName, index, argumentTypeList, argumentCount, isVoidReturn);
-            }
-        } else if (!proxiedMethodsRefSet.contains(methodKey)) {
+        if (!proxiedMethodsRefSet.contains(methodKey)) {
             int index = proxyMethodCount++;
-            // if the target is not being proxied then we generate a subclass where only the proxied methods are overridden
-            // Each overridden method calls super.blah(..) thus maintaining class semantics better and providing smaller more efficient
-            // proxies
 
-            String methodProxyShortName = "$$proxy" + index;
-            String bridgeName = "$$access" + index;
-            String methodExecutorClassName = proxyFullName + methodProxyShortName;
+            String interceptedProxyClassName = null;
+            String interceptedProxyBridgeMethodName = null;
 
-            List<Object> bridgeArguments = new ArrayList<>();
-            bridgeArguments.add(proxyFullName);
-            bridgeArguments.addAll(argumentTypeList);
-            String bridgeDesc = getMethodDescriptor(returnType, bridgeArguments);
-            boolean isSuspend = "kotlin.coroutines.Continuation".equals(CollectionUtils.last(argumentTypes.values()));
-            ExecutableMethodWriter executableMethodWriter = new ExecutableMethodWriter(
-                    proxyFullName,
-                    methodExecutorClassName,
-                    methodProxyShortName,
-                    interfaceMethod,
-                    isAbstract,
-                    isDefault,
-                    isSuspend,
-                    getOriginatingElement(),
-                    annotationMetadata) {
+            if (!isProxyTarget) {
+                // if the target is not being proxied then we need to generate a bridge method and executable method that knows about it
 
-                @Override
-                protected void buildInvokeMethod(Type declaringTypeObject, String methodName, Object returnType, Collection<Object> argumentTypes, GeneratorAdapter invokeMethodVisitor) {
-                    if (isIntroduction && isAbstract && implementInterface) {
-                        // first argument is instance to invoke
-                        invokeMethodVisitor.loadArg(0);
-                        invokeMethodVisitor.checkCast(declaringTypeObject);
-                        // now remaining arguments
-                        for (int i = 0; i < argumentTypeList.size(); i++) {
-                            invokeMethodVisitor.loadArg(1);
-                            invokeMethodVisitor.push(i);
-                            invokeMethodVisitor.visitInsn(AALOAD);
-                            AopProxyWriter.pushCastToType(invokeMethodVisitor, argumentTypeList.get(i));
-                        }
-                        String desc = getMethodDescriptor(returnType, argumentTypeList);
-                        invokeMethodVisitor.visitMethodInsn(interfaceMethod ? INVOKEINTERFACE : INVOKEVIRTUAL, declaringTypeObject.getInternalName(), methodName, desc, interfaceMethod);
-                        if (isVoidReturn) {
-                            invokeMethodVisitor.visitInsn(ACONST_NULL);
-                        } else {
-                            AopProxyWriter.pushBoxPrimitiveIfNecessary(returnType, invokeMethodVisitor);
-                        }
-                        invokeMethodVisitor.visitInsn(ARETURN);
-                        invokeMethodVisitor.visitMaxs(AbstractClassFileWriter.DEFAULT_MAX_STACK, 1);
-                        invokeMethodVisitor.visitEnd();
-                    } else {
-                        Label invokeTargetBlock = new Label();
+                if (!interfaceMethod && !isAbstract) {
+                    interceptedProxyClassName = proxyFullName;
+                    interceptedProxyBridgeMethodName = "$$access$$" + methodName;
 
-                        // load this
-                        invokeMethodVisitor.loadThis();
-                        // first argument to static bridge is reference to parent
-                        invokeMethodVisitor.getField(methodType, FIELD_PARENT, proxyType);
-                        // duplicate value
-                        invokeMethodVisitor.dup();
-                        // load target
-                        invokeMethodVisitor.loadArg(0);
-                        // compare parent == target
-                        invokeMethodVisitor.ifCmp(Type.getType(Object.class), GeneratorAdapter.NE, invokeTargetBlock);
+                    String bridgeDesc = getMethodDescriptor(returnType, argumentTypeList);
 
-                        // Invoke method on the static parent field
-
-                        // load arguments
-                        for (int i = 0; i < argumentTypeList.size(); i++) {
-                            invokeMethodVisitor.loadArg(1);
-                            invokeMethodVisitor.push(i);
-                            invokeMethodVisitor.visitInsn(AALOAD);
-                            AopProxyWriter.pushCastToType(invokeMethodVisitor, argumentTypeList.get(i));
-                        }
-                        invokeMethodVisitor.visitMethodInsn(INVOKESTATIC, proxyInternalName, bridgeName, bridgeDesc, false);
-                        if (isVoidReturn) {
-                            invokeMethodVisitor.visitInsn(ACONST_NULL);
-                        } else {
-                            AopProxyWriter.pushBoxPrimitiveIfNecessary(returnType, invokeMethodVisitor);
-                        }
-                        invokeMethodVisitor.visitInsn(ARETURN);
-
-                        invokeMethodVisitor.visitLabel(invokeTargetBlock);
-
-                        // remove parent
-                        invokeMethodVisitor.pop();
-
-                        // Invoke method on the target
-                        super.buildInvokeMethod(declaringTypeObject, methodName, returnType, argumentTypes, invokeMethodVisitor);
+                    // now build a bridge to invoke the original method
+                    MethodVisitor bridgeWriter = classWriter.visitMethod(ACC_SYNTHETIC,
+                            interceptedProxyBridgeMethodName, bridgeDesc, null, null);
+                    GeneratorAdapter bridgeGenerator = new GeneratorAdapter(bridgeWriter, ACC_SYNTHETIC, interceptedProxyBridgeMethodName, bridgeDesc);
+                    bridgeGenerator.loadThis();
+                    for (int i = 0; i < argumentTypeList.size(); i++) {
+                        bridgeGenerator.loadArg(i);
                     }
+                    String desc = getMethodDescriptor(returnType, argumentTypeList);
+                    bridgeWriter.visitMethodInsn(INVOKESPECIAL, declaringTypeReference.getInternalName(), methodName, desc, isDefault);
+                    pushReturnValue(bridgeWriter, returnType);
+                    bridgeWriter.visitMaxs(DEFAULT_MAX_STACK, 1);
+                    bridgeWriter.visitEnd();
                 }
 
-            };
-            executableMethodWriter.makeInner(proxyInternalName, classWriter);
-            executableMethodWriter.visitMethod(
+            }
+
+            // Create executable method to access
+
+            BeanDefinitionWriter beanDefinitionWriter = parentWriter == null ? proxyBeanDefinitionWriter : parentWriter;
+            ExecutableMethodWriter executableMethodWriter = beanDefinitionWriter.visitExecutableMethod(
                     declaringType,
                     returnType,
                     genericReturnType,
@@ -626,25 +563,20 @@ public class AopProxyWriter extends AbstractClassFileWriter implements ProxyingB
                     argumentTypes,
                     genericParameters,
                     argumentAnnotationMetadata,
-                    genericTypes
+                    genericTypes,
+                    annotationMetadata,
+                    interfaceMethod,
+                    isAbstract,
+                    isDefault,
+                    interceptedProxyClassName,
+                    interceptedProxyBridgeMethodName
             );
 
             proxiedMethods.add(executableMethodWriter);
             proxiedMethodsRefSet.add(methodKey);
-            String overrideDescriptor = buildMethodOverride(returnType, methodName, index, argumentTypeList, argumentCount, isVoidReturn);
+            proxyTargetMethods.add(methodKey);
 
-            // now build a bridge to invoke the original method
-            MethodVisitor bridgeWriter = classWriter.visitMethod(ACC_STATIC | ACC_SYNTHETIC,
-                    bridgeName, bridgeDesc, null, null);
-            GeneratorAdapter bridgeGenerator = new GeneratorAdapter(bridgeWriter, ACC_STATIC + ACC_SYNTHETIC, bridgeName, bridgeDesc);
-            for (int i = 0; i < bridgeArguments.size(); i++) {
-                bridgeGenerator.loadArg(i);
-            }
-
-            bridgeWriter.visitMethodInsn(INVOKESPECIAL, declaringTypeReference.getInternalName(), methodName, overrideDescriptor, isDefault);
-            pushReturnValue(bridgeWriter, returnType);
-            bridgeWriter.visitMaxs(DEFAULT_MAX_STACK, 1);
-            bridgeWriter.visitEnd();
+            buildMethodOverride(returnType, methodName, index, argumentTypeList, argumentCount, isVoidReturn);
         }
     }
 
@@ -970,7 +902,7 @@ public class AopProxyWriter extends AbstractClassFileWriter implements ProxyingB
 
         // now initialize the held values
         if (isProxyTarget) {
-            if (proxyTargetMethods.size() == proxyMethodCount) {
+            if (proxiedMethods.size() == proxyMethodCount) {
 
                 Iterator<MethodRef> iterator = proxyTargetMethods.iterator();
                 for (int i = 0; i < proxyMethodCount; i++) {
@@ -1020,8 +952,7 @@ public class AopProxyWriter extends AbstractClassFileWriter implements ProxyingB
                 Type methodType = Type.getObjectType(executableMethodWriter.getInternalName());
                 proxyConstructorGenerator.newInstance(methodType);
                 proxyConstructorGenerator.dup();
-                proxyConstructorGenerator.loadThis();
-                proxyConstructorGenerator.invokeConstructor(methodType, new Method(CONSTRUCTOR_NAME, getConstructorDescriptor(proxyFullName)));
+                proxyConstructorGenerator.invokeConstructor(methodType, new Method(CONSTRUCTOR_NAME, getConstructorDescriptor()));
                 proxyConstructorGenerator.visitInsn(AASTORE);
                 pushResolveInterceptorsCall(proxyConstructorGenerator, i, introduction);
             }
@@ -1072,9 +1003,6 @@ public class AopProxyWriter extends AbstractClassFileWriter implements ProxyingB
         proxyBeanDefinitionWriter.accept(visitor);
         try (OutputStream out = visitor.visitClass(proxyFullName, getOriginatingElement())) {
             out.write(classWriter.toByteArray());
-            for (ExecutableMethodWriter method : proxiedMethods) {
-                method.accept(visitor);
-            }
         }
     }
 
