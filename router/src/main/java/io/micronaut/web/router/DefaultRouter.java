@@ -20,6 +20,7 @@ import io.micronaut.core.order.OrderUtil;
 import io.micronaut.core.reflect.ClassUtils;
 import io.micronaut.core.util.CollectionUtils;
 import io.micronaut.core.util.PathMatcher;
+import io.micronaut.core.util.SupplierUtil;
 import io.micronaut.http.*;
 import io.micronaut.http.annotation.Filter;
 import io.micronaut.http.annotation.FilterMatcher;
@@ -51,9 +52,24 @@ public class DefaultRouter implements Router, HttpServerFilterResolver<RouteMatc
 
     private final Map<String, List<UriRoute>> routesByMethod = new HashMap<>();
     private final List<StatusRoute> statusRoutes = new ArrayList<>();
-    private final Collection<FilterRoute> filterRoutes = new ArrayList<>();
     private final List<ErrorRoute> errorRoutes = new ArrayList<>();
     private final Set<Integer> exposedPorts;
+    private final List<FilterRoute> alwaysMatchesFilterRoutes = new ArrayList<>();
+    private final List<FilterRoute> preconditionFilterRoutes = new ArrayList<>();
+    private final Supplier<List<HttpFilter>> alwaysMatchesHttpFilters = SupplierUtil.memoized(new Supplier<List<HttpFilter>>() {
+
+        @Override
+        public List<HttpFilter> get() {
+            if (alwaysMatchesFilterRoutes.isEmpty()) {
+                return Collections.emptyList();
+            }
+            List<HttpFilter> httpFilters = new ArrayList<>(alwaysMatchesFilterRoutes.size());
+            for (FilterRoute filterRoute : alwaysMatchesFilterRoutes) {
+                httpFilters.add(filterRoute.getFilter());
+            }
+            return httpFilters;
+        }
+    });
 
     /**
      * Construct a new router for the given route builders.
@@ -63,6 +79,7 @@ public class DefaultRouter implements Router, HttpServerFilterResolver<RouteMatc
     @Inject
     public DefaultRouter(Collection<RouteBuilder> builders) {
         Set<Integer> exposedPorts = new HashSet<>(5);
+        List<FilterRoute> filterRoutes = new ArrayList<>();
         for (RouteBuilder builder : builders) {
             List<UriRoute> constructedRoutes = builder.getUriRoutes();
             for (UriRoute route : constructedRoutes) {
@@ -84,7 +101,7 @@ public class DefaultRouter implements Router, HttpServerFilterResolver<RouteMatc
                 }
                 this.errorRoutes.add(errorRoute);
             }
-            this.filterRoutes.addAll(builder.getFilterRoutes());
+            filterRoutes.addAll(builder.getFilterRoutes());
             exposedPorts.addAll(builder.getExposedPorts());
         }
 
@@ -95,6 +112,30 @@ public class DefaultRouter implements Router, HttpServerFilterResolver<RouteMatc
         }
 
         routesByMethod.values().forEach(this::finalizeRoutes);
+        for (FilterRoute filterRoute : filterRoutes) {
+            if (isMatchesAll(filterRoute)) {
+                alwaysMatchesFilterRoutes.add(filterRoute);
+            } else {
+                preconditionFilterRoutes.add(filterRoute);
+            }
+        }
+    }
+
+    private boolean isMatchesAll(FilterRoute filterRoute) {
+        if (filterRoute.getAnnotationMetadata().hasStereotype(FilterMatcher.NAME)) {
+            return false;
+        }
+        if (filterRoute.hasMethods()) {
+            return false;
+        }
+        if (filterRoute.hasPatterns()) {
+            for (String pattern : filterRoute.getPatterns()) {
+                if (!Filter.MATCH_ALL_PATTERN.equals(pattern)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -391,30 +432,24 @@ public class DefaultRouter implements Router, HttpServerFilterResolver<RouteMatc
     @NonNull
     @Override
     public List<HttpFilter> findFilters(@NonNull HttpRequest<?> request) {
-        if (!filterRoutes.isEmpty()) {
-
-            Object o = request.getAttribute(HttpAttributes.ROUTE_MATCH).orElse(null);
-            if (o instanceof RouteMatch) {
-                RouteMatch<?> routeMatch = (RouteMatch<?>) o;
-                return resolveFilters(request, filterRouteStream(routeMatch));
-            } else {
-
-                List<HttpFilter> httpFilters = new ArrayList<>(filterRoutes.size());
-                HttpMethod method = request.getMethod();
-                URI uri = request.getUri();
-                for (FilterRoute filterRoute : filterRoutes) {
-                    Optional<HttpFilter> match = filterRoute.match(method, uri);
-                    match.ifPresent(httpFilters::add);
-                }
-                if (!httpFilters.isEmpty()) {
-                    OrderUtil.sort(httpFilters);
-                    return Collections.unmodifiableList(httpFilters);
-                } else {
-                    return Collections.emptyList();
+        if (preconditionFilterRoutes.isEmpty()) {
+            return alwaysMatchesHttpFilters.get();
+        }
+        List<HttpFilter> httpFilters = new ArrayList<>(alwaysMatchesFilterRoutes.size() + preconditionFilterRoutes.size());
+        httpFilters.addAll(alwaysMatchesHttpFilters.get());
+        RouteMatch routeMatch = (RouteMatch) request.getAttribute(HttpAttributes.ROUTE_MATCH).filter(o -> o instanceof RouteMatch).orElse(null);
+        HttpMethod method = request.getMethod();
+        URI uri = request.getUri();
+        for (FilterRoute filterRoute : preconditionFilterRoutes) {
+            if (routeMatch != null) {
+                if (!matchesFilterMatcher(filterRoute, routeMatch)) {
+                    continue;
                 }
             }
+            filterRoute.match(method, uri).ifPresent(httpFilters::add);
         }
-        return Collections.emptyList();
+        httpFilters.sort(OrderUtil.COMPARATOR);
+        return Collections.unmodifiableList(httpFilters);
     }
 
     @SuppressWarnings("unchecked")
@@ -440,10 +475,7 @@ public class DefaultRouter implements Router, HttpServerFilterResolver<RouteMatc
             final String uriStr = uri.toString();
             List<UriRouteMatch<T, R>> routeMatches = new ArrayList<>(routes.size());
             for (UriRoute route : routes) {
-                final UriRouteMatch match = route.match(uriStr).orElse(null);
-                if (match != null) {
-                    routeMatches.add(match);
-                }
+                route.match(uriStr).ifPresent(routeMatches::add);
             }
             return routeMatches;
         } else {
@@ -490,52 +522,57 @@ public class DefaultRouter implements Router, HttpServerFilterResolver<RouteMatc
     }
 
     @Override
-    public List<FilterEntry<HttpFilter>> resolveFilterEntries(RouteMatch<?> context) {
-        return filterRouteStream(context)
-                    .collect(Collectors.toList());
+    public List<FilterEntry<HttpFilter>> resolveFilterEntries(RouteMatch<?> routeMatch) {
+        if (preconditionFilterRoutes.isEmpty()) {
+            return (List) alwaysMatchesFilterRoutes;
+        }
+        List<FilterEntry<HttpFilter>> filterEntries = new ArrayList<>(alwaysMatchesFilterRoutes.size() + preconditionFilterRoutes.size());
+        filterEntries.addAll(alwaysMatchesFilterRoutes);
+        for (FilterRoute filterRoute : preconditionFilterRoutes) {
+            if (!matchesFilterMatcher(filterRoute, routeMatch)) {
+                filterEntries.add(filterRoute);
+            }
+        }
+        filterEntries.sort(OrderUtil.COMPARATOR);
+        return Collections.unmodifiableList(filterEntries);
     }
 
     @Override
     public List<HttpFilter> resolveFilters(HttpRequest<?> request, List<FilterEntry<HttpFilter>> filterEntries) {
-        Stream<FilterEntry<HttpFilter>> entryStream = filterEntries.stream();
-        return resolveFilters(request, entryStream);
-    }
-
-    private List<HttpFilter> resolveFilters(HttpRequest<?> request, Stream<? extends FilterEntry<HttpFilter>> entryStream) {
-        return entryStream
-                    .filter(entry -> {
-                        if (entry.hasMethods() && !entry.getFilterMethods().contains(request.getMethod())) {
-                            return false;
-                        }
-                        if (entry.hasPatterns()) {
-                            String path = request.getPath();
-                            String[] patterns = entry.getPatterns();
-                            for (String pattern : patterns) {
-                                if (Filter.MATCH_ALL_PATTERN.equals(pattern) || PathMatcher.ANT.matches(pattern, path)) {
-                                    return true;
-                                }
-                            }
-                            return false;
-                        }
-                        return true;
-                    })
-                    .map(FilterEntry::getFilter)
-                    .sorted(OrderUtil.COMPARATOR)
-                    .collect(Collectors.toList());
-    }
-
-    private Stream<FilterRoute> filterRouteStream(RouteMatch<?> context) {
-        return filterRoutes.stream()
-                .filter(filterRoute -> {
-                    AnnotationMetadata annotationMetadata = filterRoute.getAnnotationMetadata();
-                    boolean matches = !annotationMetadata.hasStereotype(FilterMatcher.NAME);
+        List<HttpFilter> httpFilters = new ArrayList<>(filterEntries.size());
+        for (FilterEntry<HttpFilter> entry : filterEntries) {
+            if (entry.hasMethods() && !entry.getFilterMethods().contains(request.getMethod())) {
+                continue;
+            }
+            if (entry.hasPatterns()) {
+                String path = request.getPath();
+                String[] patterns = entry.getPatterns();
+                boolean matches = true;
+                for (String pattern : patterns) {
                     if (!matches) {
-                        String filterAnnotation = annotationMetadata.getAnnotationNameByStereotype(FilterMatcher.NAME).orElse(null);
-                        if (filterAnnotation != null) {
-                            matches = context.getAnnotationMetadata().hasStereotype(filterAnnotation);
-                        }
+                        break;
                     }
-                    return matches;
-                });
+                    matches = Filter.MATCH_ALL_PATTERN.equals(pattern) || PathMatcher.ANT.matches(pattern, path);
+                }
+                if (!matches) {
+                    continue;
+                }
+            }
+            httpFilters.add(entry.getFilter());
+        }
+        httpFilters.sort(OrderUtil.COMPARATOR);
+        return Collections.unmodifiableList(httpFilters);
+    }
+
+    private boolean matchesFilterMatcher(FilterRoute filterRoute, RouteMatch<?> context) {
+        AnnotationMetadata annotationMetadata = filterRoute.getAnnotationMetadata();
+        boolean matches = !annotationMetadata.hasStereotype(FilterMatcher.NAME);
+        if (!matches) {
+            String filterAnnotation = annotationMetadata.getAnnotationNameByStereotype(FilterMatcher.NAME).orElse(null);
+            if (filterAnnotation != null) {
+                matches = context.getAnnotationMetadata().hasStereotype(filterAnnotation);
+            }
+        }
+        return matches;
     }
 }

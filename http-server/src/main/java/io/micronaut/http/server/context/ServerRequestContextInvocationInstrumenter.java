@@ -15,6 +15,7 @@
  */
 package io.micronaut.http.server.context;
 
+import io.micronaut.core.annotation.Internal;
 import io.micronaut.core.annotation.NonNull;
 import io.micronaut.http.HttpRequest;
 import io.micronaut.http.context.ServerRequestContext;
@@ -27,7 +28,8 @@ import io.micronaut.scheduling.instrument.InvocationInstrumenter;
  * @author dstepanov
  * @since 2.0
  */
-class ServerRequestContextInvocationInstrumenter implements InvocationInstrumenter {
+@Internal
+public class ServerRequestContextInvocationInstrumenter implements InvocationInstrumenter {
 
     private final HttpRequest<?> invocationRequest;
 

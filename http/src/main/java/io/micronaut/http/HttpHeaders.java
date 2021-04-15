@@ -594,7 +594,7 @@ public interface HttpHeaders extends Headers {
                 final String[] tokens = value.split(",");
                 for (String token : tokens) {
                     try {
-                        mediaTypes.add(new MediaType(token));
+                        mediaTypes.add(MediaType.of(token));
                     } catch (IllegalArgumentException e) {
                         // ignore
                     }

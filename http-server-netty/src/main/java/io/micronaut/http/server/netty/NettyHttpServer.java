@@ -61,6 +61,7 @@ import io.micronaut.runtime.server.event.ServerShutdownEvent;
 import io.micronaut.runtime.server.event.ServerStartupEvent;
 import io.micronaut.scheduling.TaskExecutors;
 import io.micronaut.scheduling.executor.ExecutorSelector;
+import io.micronaut.scheduling.instrument.InvocationInstrumenterFactory;
 import io.micronaut.web.router.Router;
 import io.micronaut.web.router.resource.StaticResourceResolver;
 import io.micronaut.websocket.context.WebSocketBeanRegistry;
@@ -82,6 +83,7 @@ import io.netty.handler.stream.ChunkedWriteHandler;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.AsciiString;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.ResourceLeakDetector;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import org.jetbrains.annotations.NotNull;
@@ -120,6 +122,10 @@ public class NettyHttpServer implements EmbeddedServer, WebSocketSessionReposito
 
     @SuppressWarnings("WeakerAccess")
     public static final String OUTBOUND_KEY = "-outbound-";
+    static {
+        // Netty resource leak detection has a performance overhead and we do not need it in Vert.x
+        ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.DISABLED);
+    }
 
     private static final Logger LOG = LoggerFactory.getLogger(NettyHttpServer.class);
     private final List<ChannelOutboundHandler> outboundHandlers;
@@ -192,7 +198,8 @@ public class NettyHttpServer implements EmbeddedServer, WebSocketSessionReposito
             HttpCompressionStrategy httpCompressionStrategy,
             HttpContentProcessorResolver httpContentProcessorResolver,
             ChannelOptionFactory channelOptionFactory,
-            ErrorResponseProcessor<?> errorResponseProcessor
+            ErrorResponseProcessor<?> errorResponseProcessor,
+            List<InvocationInstrumenterFactory> invocationInstrumenterFactories
     ) {
         this.httpCompressionStrategy = httpCompressionStrategy;
         Optional<File> location = serverConfiguration.getMultipart().getLocation();
@@ -239,7 +246,8 @@ public class NettyHttpServer implements EmbeddedServer, WebSocketSessionReposito
                 executorSelector,
                 SupplierUtil.memoized(ioExecutor::get),
                 httpContentProcessorResolver,
-                errorResponseProcessor
+                errorResponseProcessor,
+                invocationInstrumenterFactories
         );
         this.channelOptionFactory = channelOptionFactory;
     }
@@ -306,6 +314,10 @@ public class NettyHttpServer implements EmbeddedServer, WebSocketSessionReposito
             workerGroup = createWorkerEventLoopGroup(workerConfig);
             parentGroup = createParentEventLoopGroup();
             ServerBootstrap serverBootstrap = createServerBootstrap();
+            serverBootstrap.childOption(ChannelOption.SO_SNDBUF, 1024 * 1024);
+            serverBootstrap.childOption(ChannelOption.SO_RCVBUF, 32 * 1024);
+
+
 
             processOptions(serverConfiguration.getOptions(), serverBootstrap::option);
             processOptions(serverConfiguration.getChildOptions(), serverBootstrap::childOption);

@@ -38,6 +38,7 @@ import java.math.BigDecimal;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -50,6 +51,8 @@ import java.util.stream.Collectors;
  */
 @TypeHint(value = MediaType[].class)
 public class MediaType implements CharSequence {
+
+    static final ConcurrentHashMap<String, MediaType> CACHE = new ConcurrentHashMap<>();
 
     /**
      * Default file extension used for JSON.
@@ -359,7 +362,7 @@ public class MediaType implements CharSequence {
     static {
         ConversionService.SHARED.addConverter(CharSequence.class, MediaType.class, charSequence -> {
                     if (StringUtils.isNotEmpty(charSequence)) {
-                        return new MediaType(charSequence.toString());
+                        return of(charSequence.toString());
                     }
                     return null;
                 }
@@ -376,7 +379,7 @@ public class MediaType implements CharSequence {
      *
      * @param name The name of the media type. For example application/json
      */
-    public MediaType(String name) {
+    private MediaType(String name) {
         this(name, null, Collections.emptyMap());
     }
 
@@ -451,6 +454,61 @@ public class MediaType implements CharSequence {
         }
 
         this.strRepr = toString0();
+    }
+
+    public static MediaType of(String name) {
+        switch (name) {
+            case ALL:
+                return ALL_TYPE;
+            case APPLICATION_FORM_URLENCODED:
+                return APPLICATION_FORM_URLENCODED_TYPE;
+            case MULTIPART_FORM_DATA:
+                return MULTIPART_FORM_DATA_TYPE;
+            case TEXT_HTML:
+                return TEXT_HTML_TYPE;
+            case APPLICATION_XHTML:
+                return APPLICATION_XHTML_TYPE;
+            case APPLICATION_XML:
+                return APPLICATION_XML_TYPE;
+            case APPLICATION_JSON:
+                return APPLICATION_JSON_TYPE;
+            case APPLICATION_YAML:
+                return APPLICATION_YAML_TYPE;
+            case TEXT_XML:
+                return TEXT_XML_TYPE;
+            case TEXT_JSON:
+                return TEXT_JSON_TYPE;
+            case TEXT_PLAIN:
+                return TEXT_PLAIN_TYPE;
+            case APPLICATION_HAL_JSON:
+                return APPLICATION_HAL_JSON_TYPE;
+            case APPLICATION_HAL_XML:
+                return APPLICATION_HAL_XML_TYPE;
+            case APPLICATION_ATOM_XML:
+                return APPLICATION_ATOM_XML_TYPE;
+            case APPLICATION_VND_ERROR:
+                return APPLICATION_VND_ERROR_TYPE;
+            case TEXT_EVENT_STREAM:
+                return TEXT_EVENT_STREAM_TYPE;
+            case APPLICATION_JSON_STREAM:
+                return APPLICATION_JSON_STREAM_TYPE;
+            case APPLICATION_OCTET_STREAM:
+                return APPLICATION_OCTET_STREAM_TYPE;
+            case APPLICATION_GRAPHQL:
+                return APPLICATION_GRAPHQL_TYPE;
+            case APPLICATION_PDF:
+                return APPLICATION_PDF_TYPE;
+            case IMAGE_PNG:
+                return IMAGE_PNG_TYPE;
+            case IMAGE_JPEG:
+                return IMAGE_JPEG_TYPE;
+            case IMAGE_GIF:
+                return IMAGE_GIF_TYPE;
+            case IMAGE_WEBP:
+                return IMAGE_WEBP_TYPE;
+            default:
+                return CACHE.computeIfAbsent(name, MediaType::new);
+        }
     }
 
     /**
@@ -572,7 +630,7 @@ public class MediaType implements CharSequence {
             return false;
         }
         try {
-            return new MediaType(contentType).isTextBased();
+            return of(contentType).isTextBased();
         } catch (IllegalArgumentException e) {
             return false;
         }
@@ -587,8 +645,14 @@ public class MediaType implements CharSequence {
         if (parameters.isEmpty()) {
             return name;
         } else {
-            return name + ";" + parameters.entrySet().stream().map(Object::toString)
-                    .collect(Collectors.joining(";"));
+            StringBuilder sb = new StringBuilder(name);
+            for (Map.Entry<CharSequence, String> e : parameters.entrySet()) {
+                sb.append(";");
+                sb.append(e.getKey());
+                sb.append("=");
+                sb.append(e.getValue());
+            }
+            return sb.toString();
         }
     }
 
@@ -634,17 +698,17 @@ public class MediaType implements CharSequence {
      */
     public static List<MediaType> orderedOf(List<? extends CharSequence> values) {
         if (CollectionUtils.isNotEmpty(values)) {
-            List<MediaType> mediaTypes = new ArrayList<>(values.size());
+            List<MediaType> mediaTypes = new LinkedList<>();
             for (CharSequence value : values) {
-                final String[] tokens = value.toString().split(",");
-                for (String token : tokens) {
+                for (CharSequence token : StringUtils.splitOmitEmptyStrings(value, ',')) {
                     try {
-                        mediaTypes.add(new MediaType(token));
+                        mediaTypes.add(MediaType.of(token));
                     } catch (IllegalArgumentException e) {
                         // ignore
                     }
                 }
             }
+            mediaTypes = new ArrayList<>(mediaTypes);
             mediaTypes.sort((o1, o2) -> {
                 //The */* type is always last
                 if (o1.type.equals("*")) {
@@ -671,7 +735,7 @@ public class MediaType implements CharSequence {
      * @return The {@link MediaType}
      */
     public static MediaType of(CharSequence mediaType) {
-        return new MediaType(mediaType.toString());
+        return CACHE.computeIfAbsent(mediaType.toString(), MediaType::new);
     }
 
     /**
@@ -681,7 +745,7 @@ public class MediaType implements CharSequence {
      * @return The {@link MediaType}
      */
     public static MediaType[] of(CharSequence... mediaType) {
-        return Arrays.stream(mediaType).map(txt -> new MediaType(txt.toString())).toArray(MediaType[]::new);
+        return Arrays.stream(mediaType).map(txt -> MediaType.of(txt.toString())).toArray(MediaType[]::new);
     }
 
     /**

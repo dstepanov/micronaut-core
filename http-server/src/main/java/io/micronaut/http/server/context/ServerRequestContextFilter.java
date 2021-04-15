@@ -36,8 +36,8 @@ import java.util.List;
  * @author graemerocher
  * @since 1.0
  */
-@Filter(Filter.MATCH_ALL_PATTERN)
-@Internal
+//@Filter(Filter.MATCH_ALL_PATTERN)
+//@Internal
 public final class ServerRequestContextFilter implements HttpServerFilter {
 
     private final List<InvocationInstrumenterFactory> invocationInstrumenterFactories;

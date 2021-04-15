@@ -70,6 +70,7 @@ import io.micronaut.http.filter.HttpFilter;
 import io.micronaut.http.filter.HttpServerFilter;
 import io.micronaut.http.filter.OncePerRequestHttpServerFilter;
 import io.micronaut.http.filter.ServerFilterChain;
+import io.micronaut.http.filter.ServerFilterPhase;
 import io.micronaut.http.multipart.PartData;
 import io.micronaut.http.multipart.StreamingFileUpload;
 import io.micronaut.http.netty.AbstractNettyHttpRequest;
@@ -78,6 +79,7 @@ import io.micronaut.http.netty.NettyMutableHttpResponse;
 import io.micronaut.http.netty.content.HttpContentUtil;
 import io.micronaut.http.netty.stream.StreamedHttpRequest;
 import io.micronaut.http.server.binding.RequestArgumentSatisfier;
+import io.micronaut.http.server.context.ServerRequestContextInvocationInstrumenter;
 import io.micronaut.http.server.exceptions.ExceptionHandler;
 import io.micronaut.http.server.exceptions.InternalServerException;
 import io.micronaut.http.server.exceptions.response.ErrorContext;
@@ -97,6 +99,9 @@ import io.micronaut.inject.MethodReference;
 import io.micronaut.inject.qualifiers.Qualifiers;
 import io.micronaut.runtime.http.codec.TextPlainCodec;
 import io.micronaut.scheduling.executor.ExecutorSelector;
+import io.micronaut.scheduling.instrument.Instrumentation;
+import io.micronaut.scheduling.instrument.InvocationInstrumenter;
+import io.micronaut.scheduling.instrument.InvocationInstrumenterFactory;
 import io.micronaut.web.router.*;
 import io.micronaut.web.router.exceptions.DuplicateRouteException;
 import io.micronaut.web.router.exceptions.UnsatisfiedRouteException;
@@ -175,6 +180,8 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
     private final Supplier<ExecutorService> ioExecutorSupplier;
     private final String serverHeader;
     private final boolean multipartEnabled;
+    private final List<InvocationInstrumenterFactory> invocationInstrumenterFactories;
+
     private ExecutorService ioExecutor;
 
     /**
@@ -201,7 +208,8 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
             ExecutorSelector executorSelector,
             Supplier<ExecutorService> ioExecutor,
             HttpContentProcessorResolver httpContentProcessorResolver,
-            ErrorResponseProcessor<?> errorResponseProcessor) {
+            ErrorResponseProcessor<?> errorResponseProcessor,
+            List<InvocationInstrumenterFactory> invocationInstrumenterFactories) {
         this.mediaTypeCodecRegistry = mediaTypeCodecRegistry;
         this.customizableResponseTypeHandlerRegistry = customizableResponseTypeHandlerRegistry;
         this.beanContext = beanContext;
@@ -216,6 +224,7 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
         this.errorResponseProcessor = errorResponseProcessor;
         Optional<Boolean> multipartEnabled = serverConfiguration.getMultipart().getEnabled();
         this.multipartEnabled = !multipartEnabled.isPresent() || multipartEnabled.get();
+        this.invocationInstrumenterFactories = invocationInstrumenterFactories;
     }
 
     @Override
@@ -286,7 +295,7 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                 }
             }
 
-            ctx.writeAndFlush(new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.INTERNAL_SERVER_ERROR));
+            ctx.writeAndFlush(new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.INTERNAL_SERVER_ERROR, Unpooled.EMPTY_BUFFER));
             return;
         }
 
@@ -387,11 +396,27 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                     });
                     Supplier<Flowable<? extends MutableHttpResponse<?>>> publisherSupplier = () -> routePublisher;
                     filterPublisher(new AtomicReference<HttpRequest<?>>(nettyHttpRequest), publisherSupplier, ctx.executor(), nettyException)
-                            .firstOrError()
-                            .subscribe((mutableHttpResponse, throwable) -> {
-                                if (throwable != null) {
+                            .subscribe(new Subscriber<MutableHttpResponse<?>>() {
+
+                                MutableHttpResponse<?> mutableHttpResponse;
+
+                                @Override
+                                public void onSubscribe(Subscription s) {
+                                    s.request(1);
+                                }
+
+                                @Override
+                                public void onNext(MutableHttpResponse<?> mutableHttpResponse) {
+                                    this.mutableHttpResponse = mutableHttpResponse;
+                                }
+
+                                @Override
+                                public void onError(Throwable throwable) {
                                     writeDefaultErrorResponse(ctx, nettyHttpRequest, throwable, nettyException);
-                                } else {
+                                }
+
+                                @Override
+                                public void onComplete() {
                                     encodeHttpResponse(
                                             ctx,
                                             nettyHttpRequest,
@@ -401,8 +426,6 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                                     );
                                 }
                             });
-
-
                     if (serverConfiguration.isLogHandledExceptions()) {
                         logException(cause);
                     }
@@ -422,6 +445,18 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                 }
             }
         }
+    }
+
+    private List<InvocationInstrumenter> getInvocationInstrumenter(HttpRequest<?> request) {
+        List<InvocationInstrumenter> instrumenters = new ArrayList<>(invocationInstrumenterFactories.size() + 1);
+        instrumenters.add(new ServerRequestContextInvocationInstrumenter(request));
+        for (InvocationInstrumenterFactory instrumenterFactory : invocationInstrumenterFactories) {
+            final InvocationInstrumenter instrumenter = instrumenterFactory.newInvocationInstrumenter();
+            if (instrumenter != null) {
+                instrumenters.add(instrumenter);
+            }
+        }
+        return instrumenters;
     }
 
     @Override
@@ -638,15 +673,36 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                 () -> Flowable.just(finalResponse),
                 ctx.channel().eventLoop(),
                 skipOncePerRequest
-        ).singleOrError().subscribe((Consumer<MutableHttpResponse<?>>) mutableHttpResponse ->
-            encodeHttpResponse(
-                    ctx,
-                    nettyHttpRequest,
-                    mutableHttpResponse,
-                    mutableHttpResponse.body(),
-                    defaultResponseMediaType
-            )
-        , throwable -> exceptionCaughtInternal(ctx, throwable, nettyHttpRequest, false));
+        ).subscribe(new Subscriber<MutableHttpResponse<?>>() {
+
+            MutableHttpResponse<?> mutableHttpResponse;
+
+            @Override
+            public void onSubscribe(Subscription s) {
+                s.request(1);
+            }
+
+            @Override
+            public void onNext(MutableHttpResponse<?> mutableHttpResponse) {
+                this.mutableHttpResponse = mutableHttpResponse;
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                exceptionCaughtInternal(ctx, throwable, nettyHttpRequest, false);
+            }
+
+            @Override
+            public void onComplete() {
+                encodeHttpResponse(
+                        ctx,
+                        nettyHttpRequest,
+                        mutableHttpResponse,
+                        mutableHttpResponse.body(),
+                        defaultResponseMediaType
+                );
+            }
+        });
     }
 
     private Optional<? extends FileCustomizableResponseType> matchFile(String path) {
@@ -1099,7 +1155,7 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                     finalRoute
             );
             AtomicReference<HttpRequest<?>> requestReference = new AtomicReference<>(request);
-            Flowable<? extends MutableHttpResponse<?>> filteredPublisher = buildResultEmitter(
+            Publisher<? extends MutableHttpResponse<?>> filteredPublisher = buildResultEmitter(
                     request,
                     requestReference,
                     finalRoute,
@@ -1382,7 +1438,7 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
         return route;
     }
 
-    private Flowable<? extends MutableHttpResponse<?>> buildResultEmitter(
+    private Publisher<? extends MutableHttpResponse<?>> buildResultEmitter(
             NettyHttpRequest<?> request,
             AtomicReference<HttpRequest<?>> requestReference,
             RouteMatch<?> finalRoute,
@@ -1390,7 +1446,7 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
             boolean isErrorRoute,
             boolean skipOncePerRequest) {
         // build the result emitter. This result emitter emits the response from a controller action
-        Supplier<Flowable<? extends MutableHttpResponse<?>>> resultEmitter = () -> {
+        Supplier<Publisher<? extends MutableHttpResponse<?>>> resultEmitter = () -> {
             final RouteMatch<?> routeMatch;
 
             // ensure the route requirements are completely satisfied
@@ -1526,7 +1582,7 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                 }
             }
             outgoingResponse.setAttribute(HttpAttributes.ROUTE_MATCH, finalRoute);
-            return Flowable.just(outgoingResponse);
+            return Publishers.just(outgoingResponse);
         };
 
         // process the publisher through the available filters
@@ -1844,7 +1900,7 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
             if (body instanceof ByteBuf) {
                 nettyResponse = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, nettyStatus, (ByteBuf) body);
             } else {
-                nettyResponse = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, nettyStatus);
+                nettyResponse = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, nettyStatus, Unpooled.EMPTY_BUFFER);
             }
             io.netty.handler.codec.http.HttpHeaders nettyHeaders = nettyResponse.headers();
             message.getHeaders().forEach((BiConsumer<String, List<String>>) nettyHeaders::set);
@@ -1936,41 +1992,68 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                         .orElse(defaultStatus));
     }
 
-    private Flowable<? extends MutableHttpResponse<?>> filterPublisher(
+    private Publisher<? extends MutableHttpResponse<?>> filterPublisher(
             AtomicReference<HttpRequest<?>> requestReference,
             Supplier<? extends Publisher<? extends MutableHttpResponse<?>>> routePublisherSupplier,
             @Nullable ExecutorService executor,
             boolean skipOncePerRequest) {
-        Publisher<? extends io.micronaut.http.MutableHttpResponse<?>> finalPublisher;
-        List<HttpFilter> filters = new ArrayList<>(router.findFilters(requestReference.get()));
+        Publisher<MutableHttpResponse<?>> responsePublisher = new Publisher<MutableHttpResponse<?>>() {
+
+            Publisher<? extends MutableHttpResponse<?>> actual;
+
+            @Override
+            public void subscribe(Subscriber<? super MutableHttpResponse<?>> actualSubscriber) {
+                HttpRequest<?> request = requestReference.get();
+                if (executor == null) {
+                    doSubscribe(actualSubscriber, request);
+                } else {
+                    executor.execute(() -> doSubscribe(actualSubscriber, request));
+                }
+            }
+
+            private void doSubscribe(Subscriber<? super MutableHttpResponse<?>> actualSubscriber, HttpRequest<?> request) {
+                try (Instrumentation instrumentation = InvocationInstrumenter.combine(getInvocationInstrumenter(request)).newInstrumentation()) {
+                    if (actual == null) {
+                        actual = routePublisherSupplier.get();
+                    }
+                    InvocationInstrumenter invocationInstrumenterAfterProceed
+                            = InvocationInstrumenter.combine(getInvocationInstrumenter(request));
+                    try (Instrumentation ignored = invocationInstrumenterAfterProceed.newInstrumentation()) {
+                        actual.subscribe(actualSubscriber);
+                    }
+                }
+            }
+        };
+        List<HttpFilter> httpFilters = router.findFilters(requestReference.get());
+        if (httpFilters.isEmpty()) {
+            return responsePublisher;
+        }
+        List<HttpFilter> filters = new ArrayList<>(httpFilters);
         if (skipOncePerRequest) {
             filters.removeIf(filter -> filter instanceof OncePerRequestHttpServerFilter);
         }
-        if (!filters.isEmpty()) {
-            // make the action executor the last filter in the chain
-            filters.add((HttpServerFilter) (req, chain) -> Flowable.defer(() ->
-                    applyExecutorToPublisher(Flowable.defer(routePublisherSupplier::get), executor)));
-            AtomicInteger integer = new AtomicInteger();
-            int len = filters.size();
-            ServerFilterChain filterChain = new ServerFilterChain() {
-                @SuppressWarnings("unchecked")
-                @Override
-                public Publisher<MutableHttpResponse<?>> proceed(io.micronaut.http.HttpRequest<?> request) {
-                    int pos = integer.incrementAndGet();
-                    if (pos > len) {
-                        throw new IllegalStateException("The FilterChain.proceed(..) method should be invoked exactly once per filter execution. The method has instead been invoked multiple times by an erroneous filter definition.");
-                    }
-                    HttpFilter httpFilter = filters.get(pos);
-                    return (Publisher<MutableHttpResponse<?>>) httpFilter.doFilter(requestReference.getAndSet(request), this);
-                }
-            };
-            HttpFilter httpFilter = filters.get(0);
-            Publisher<? extends HttpResponse<?>> resultingPublisher = httpFilter.doFilter(requestReference.get(), filterChain);
-            finalPublisher = (Publisher<? extends MutableHttpResponse<?>>) resultingPublisher;
-        } else {
-            finalPublisher = applyExecutorToPublisher(routePublisherSupplier.get(), executor);
+        if (filters.isEmpty()) {
+            return responsePublisher;
         }
-        return publisherToFlowable(finalPublisher);
+        // make the action executor the last filter in the chain
+        filters.add((HttpServerFilter) (req, chain) -> Flowable.defer(() ->
+                applyExecutorToPublisher(Flowable.defer(routePublisherSupplier::get), executor)));
+        AtomicInteger integer = new AtomicInteger();
+        int len = filters.size();
+        ServerFilterChain filterChain = new ServerFilterChain() {
+            @SuppressWarnings("unchecked")
+            @Override
+            public Publisher<MutableHttpResponse<?>> proceed(io.micronaut.http.HttpRequest<?> request) {
+                int pos = integer.incrementAndGet();
+                if (pos > len) {
+                    throw new IllegalStateException("The FilterChain.proceed(..) method should be invoked exactly once per filter execution. The method has instead been invoked multiple times by an erroneous filter definition.");
+                }
+                HttpFilter httpFilter = filters.get(pos);
+                return (Publisher<MutableHttpResponse<?>>) httpFilter.doFilter(requestReference.getAndSet(request), this);
+            }
+        };
+        HttpFilter httpFilter = filters.get(0);
+        return (Publisher<? extends MutableHttpResponse<?>>) httpFilter.doFilter(requestReference.get(), filterChain);
     }
 
     private <T extends MutableHttpResponse<?>> Publisher<T> applyExecutorToPublisher(
