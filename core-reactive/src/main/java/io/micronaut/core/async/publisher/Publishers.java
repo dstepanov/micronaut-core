@@ -232,7 +232,7 @@ public class Publishers {
     }
 
     /**
-     * Map the result from a publisher using the given mapper or supply empty value
+     * Map the result from a publisher using the given mapper or supply empty value.
      *
      * @param publisher The publisher
      * @param mapOrSupplyEmpty    The mapOrSupplyEmpty
@@ -454,11 +454,29 @@ public class Publishers {
         return new IllegalArgumentException("Cannot convert reactive type [" + object.getClass() + "] to type [" + publisherType + "]. Ensure that you have the necessary Reactive module on your classpath. For example for Reactor you should have 'micronaut-reactor'.");
     }
 
+    /**
+     * Maps the next result or supplies an empty result.
+     *
+     * @param <T> The next type
+     * @param <R> The mapped to type
+     * @since 2.5.0
+     */
     public interface MapOrSupplyEmpty<T, R> {
 
-        public R map(T result);
+        /**
+         * Maps next result.
+         *
+         * @param result The next value.
+         * @return The mapped value.
+         */
+        R map(T result);
 
-        public R supplyEmpty();
+        /**
+         * Supplies an empty value if there is no next value.
+         *
+         * @return The result.
+         */
+        R supplyEmpty();
 
     }
 
