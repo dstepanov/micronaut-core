@@ -249,8 +249,12 @@ public abstract class JacksonMediaTypeCodec implements MediaTypeCodec {
 
     @Override
     public <T, B> ByteBuffer<B> encode(T object, ByteBufferFactory<?, B> allocator) throws CodecException {
+        if (object instanceof byte[]) {
+            return allocator.copiedBuffer((byte[]) object);
+        }
         ByteBuffer<B> buffer = allocator.buffer();
-        encode(object, buffer.toOutputStream());
+        OutputStream outputStream = buffer.toOutputStream();
+        encode(object, outputStream);
         return buffer;
     }
 
