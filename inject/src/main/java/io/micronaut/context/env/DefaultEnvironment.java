@@ -557,14 +557,11 @@ public class DefaultEnvironment extends PropertySourcePropertyResolver implement
     private Collection<PropertySourceLoader> evaluatePropertySourceLoaders() {
         SoftServiceLoader<PropertySourceLoader> definitions = readPropertySourceLoaders();
         Collection<PropertySourceLoader> allLoaders = new ArrayList<>(10);
-        for (ServiceDefinition<PropertySourceLoader> definition : definitions) {
-            if (definition.isPresent()) {
-                PropertySourceLoader loader = definition.load();
-                allLoaders.add(loader);
-                Set<String> extensions = loader.getExtensions();
-                for (String extension : extensions) {
-                    loaderByFormatMap.put(extension, loader);
-                }
+        definitions.collectAll(allLoaders);
+        for (PropertySourceLoader propertySourceLoader : allLoaders) {
+            Set<String> extensions = propertySourceLoader.getExtensions();
+            for (String extension : extensions) {
+                loaderByFormatMap.put(extension, propertySourceLoader);
             }
         }
         return allLoaders;

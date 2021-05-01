@@ -46,6 +46,7 @@ import javax.lang.model.element.TypeElement
 import javax.lang.model.element.VariableElement
 import javax.tools.JavaFileObject
 import java.lang.annotation.Annotation
+import java.util.function.Predicate
 
 /**
  * @author Graeme Rocher
@@ -164,14 +165,14 @@ abstract class AbstractTypeElementSpec extends Specification {
 
         return new DefaultApplicationContext(ClassPathResourceLoader.defaultLoader(classLoader),"test") {
             @Override
-            protected List<BeanDefinitionReference> resolveBeanDefinitionReferences() {
+            protected List<BeanDefinitionReference> resolveBeanDefinitionReferences(Predicate<BeanDefinitionReference> predicate) {
                 files.findAll { JavaFileObject jfo ->
                     jfo.kind == JavaFileObject.Kind.CLASS && jfo.name.endsWith("DefinitionClass.class")
                 }.collect { JavaFileObject jfo ->
                     def name = jfo.toUri().toString().substring("mem:///CLASS_OUTPUT/".length())
                     name = name.replace('/', '.') - '.class'
                     return classLoader.loadClass(name).newInstance()
-                } as List<BeanDefinitionReference>
+                }.findAll { predicate == null || predicate.test(it) } as List<BeanDefinitionReference>
             }
         }.start()
     }
