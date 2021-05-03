@@ -814,6 +814,17 @@ subprojects { Project subproject ->
         }
     }
 
+        java {
+                sourceCompatibility = JavaVersion.VERSION_11
+                targetCompatibility = JavaVersion.VERSION_11
+        }
+
+
+        micronautBuild {
+                sourceCompatibility = 8
+                targetCompatibility = 11
+        }
+
     configurations {
         shadowCompile
         all {
