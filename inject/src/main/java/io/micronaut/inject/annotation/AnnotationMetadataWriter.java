@@ -32,6 +32,7 @@ import java.io.OutputStream;
 import java.lang.reflect.Array;
 import java.util.*;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 /**
  * Responsible for writing class files that are instances of {@link AnnotationMetadata}.
@@ -413,7 +414,8 @@ public class AnnotationMetadataWriter extends AbstractClassFileWriter {
             generatorAdapter.getStatic(Type.getType(Collections.class), EMPTY_MAP, MAP_TYPE);
             return;
         }
-        Set<? extends Map.Entry<? extends CharSequence, T>> entrySet = annotationData.entrySet();
+        Set<? extends Map.Entry<? extends CharSequence, T>> entrySet = annotationData.entrySet()
+                .stream().filter(e -> e.getValue() == null).collect(Collectors.toSet());
         if (MAP_OF != null) {
             if (entrySet.size() <= MAP_OF.length) {
                 for (Map.Entry<? extends CharSequence, T> entry : entrySet) {
@@ -463,6 +465,9 @@ public class AnnotationMetadataWriter extends AbstractClassFileWriter {
     }
 
     private static void pushListOfString(GeneratorAdapter methodVisitor, List<String> names) {
+        if (names != null) {
+            names = names.stream().filter(Objects::nonNull).collect(Collectors.toList());
+        }
         if (names == null || names.isEmpty()) {
             methodVisitor.getStatic(Type.getType(Collections.class), EMPTY_LIST, LIST_TYPE);
             return;
@@ -526,7 +531,7 @@ public class AnnotationMetadataWriter extends AbstractClassFileWriter {
         // 4th argument: all annotations
         pushCreateAnnotationData(owningType, declaringClassWriter, generatorAdapter, annotationMetadata.allAnnotations, loadTypeMethods, annotationMetadata.getSourceRetentionAnnotations());
         // 5th argument: annotations by stereotype
-        pushCreateAnnotationsByStereotypeData(generatorAdapter, annotationMetadata.annotationsByStereotype);
+        pushMapOf(generatorAdapter, annotationMetadata.annotationsByStereotype, list -> pushListOfString(generatorAdapter, list));
         // 6th argument: has property expressions
         generatorAdapter.push(annotationMetadata.hasPropertyExpressions());
 
@@ -563,10 +568,6 @@ public class AnnotationMetadataWriter extends AbstractClassFileWriter {
         }
         classWriter.visitEnd();
         return classWriter;
-    }
-
-    private static void pushCreateAnnotationsByStereotypeData(GeneratorAdapter methodVisitor, Map<String, List<String>> annotationData) {
-        pushMapOf(methodVisitor, annotationData, list -> pushListOfString(methodVisitor, list));
     }
 
     private static void pushCreateAnnotationData(
@@ -661,11 +662,8 @@ public class AnnotationMetadataWriter extends AbstractClassFileWriter {
             methodVisitor.dup();
             methodVisitor.push(annotationName);
 
-            if (CollectionUtils.isNotEmpty(values)) {
-                pushMapOf(methodVisitor, values, v -> pushValue(declaringType, declaringClassWriter, methodVisitor, v, loadTypeMethods));
-            } else {
-                methodVisitor.getStatic(Type.getType(Collections.class), "EMPTY_MAP", Type.getType(Map.class));
-            }
+            pushMapOf(methodVisitor, values, v -> pushValue(declaringType, declaringClassWriter, methodVisitor, v, loadTypeMethods));
+
             methodVisitor.push(annotationName);
             methodVisitor.invokeStatic(Type.getType(AnnotationMetadataSupport.class), METHOD_GET_DEFAULT_VALUES);
             methodVisitor.invokeConstructor(annotationValueType, CONSTRUCTOR_ANNOTATION_VALUE_AND_MAP);
