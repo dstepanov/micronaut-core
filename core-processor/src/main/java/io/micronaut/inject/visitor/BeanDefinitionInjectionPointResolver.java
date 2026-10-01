@@ -23,12 +23,20 @@ import io.micronaut.inject.ast.ClassElement;
 import java.util.Optional;
 
 /**
- * Resolves injection point shapes which are not part of the core Java type model.
+ * Resolves injection point shapes for language and container integrations.
  *
  * <p>Language integrations can use this extension point to map collection-like,
  * optional, or other language-specific types to one of the standard
  * {@link BeanDefinitionInjectionPoint} implementations. Returning an empty
  * optional lets the core processor treat the requested type as a single bean.</p>
+ *
+ * <p>Implementations registered through {@link java.util.ServiceLoader} on the
+ * processor classpath are consulted before the built-in bean container shapes,
+ * after explicit parameter and property/value injection. They may return a
+ * {@link BeanDefinitionInjectionPoint.BeanInjectionPoint} to request one bean of
+ * the full declared type instead of optional wrapping or collection aggregation.
+ * Returning empty preserves the built-in behavior. The visitor context's
+ * language-specific resolver is still consulted after the built-in shapes.</p>
  *
  * @author Graeme Rocher
  * @since 5.2.0

@@ -39,6 +39,8 @@ import io.micronaut.core.annotation.AnnotationUtil;
 import io.micronaut.core.annotation.Creator;
 import io.micronaut.core.annotation.ReflectiveAccess;
 import io.micronaut.core.expressions.EvaluatedExpressionReference;
+import io.micronaut.core.io.service.SoftServiceLoader;
+import io.micronaut.inject.visitor.BeanDefinitionInjectionPointResolver;
 import io.micronaut.inject.ast.ClassElement;
 import io.micronaut.inject.ast.ConstructorElement;
 import io.micronaut.inject.ast.Element;
@@ -66,6 +68,9 @@ import java.util.stream.Stream;
  * @since 5.1.0
  */
 public class BeanInjectionUtils {
+
+    private static final List<BeanDefinitionInjectionPointResolver> INJECTION_POINT_RESOLVERS =
+        SoftServiceLoader.load(BeanDefinitionInjectionPointResolver.class, BeanInjectionUtils.class.getClassLoader()).collectAll();
 
     /**
      * Creates a {@link FieldDefinition} describing injection for the supplied field.
@@ -308,6 +313,13 @@ public class BeanInjectionUtils {
                 BeanDefinitionInjectionPoint<ClassElement> result = createPropertyOrValueInjectionPoint(genericType, annotationMetadata, parameterName);
                 if (result != null) {
                     return result;
+                }
+            }
+            for (BeanDefinitionInjectionPointResolver resolver : INJECTION_POINT_RESOLVERS) {
+                Optional<BeanDefinitionInjectionPoint<ClassElement>> resolved =
+                    resolver.resolve(beanType, genericType, annotationMetadata, parameterName, visitorContext);
+                if (resolved.isPresent()) {
+                    return resolved.get();
                 }
             }
             isArray = genericType.isArray();
