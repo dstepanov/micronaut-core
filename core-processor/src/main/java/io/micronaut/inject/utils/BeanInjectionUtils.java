@@ -16,11 +16,13 @@
 package io.micronaut.inject.utils;
 
 import io.micronaut.context.BeanRegistration;
+import io.micronaut.context.BeanInjectionProvider;
 import io.micronaut.context.annotation.ConfigurationReader;
 import io.micronaut.context.annotation.EachBean;
 import io.micronaut.context.annotation.EachProperty;
 import io.micronaut.context.annotation.Parameter;
 import io.micronaut.context.annotation.Property;
+import io.micronaut.context.annotation.ResolveWith;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.context.beans.definition.BeanDefinitionInjectionPoint;
 import io.micronaut.context.beans.definition.BeanDefinitionInjectionPoint.BeanInjectionPoint;
@@ -39,8 +41,6 @@ import io.micronaut.core.annotation.AnnotationUtil;
 import io.micronaut.core.annotation.Creator;
 import io.micronaut.core.annotation.ReflectiveAccess;
 import io.micronaut.core.expressions.EvaluatedExpressionReference;
-import io.micronaut.core.io.service.SoftServiceLoader;
-import io.micronaut.inject.visitor.BeanDefinitionInjectionPointResolver;
 import io.micronaut.inject.ast.ClassElement;
 import io.micronaut.inject.ast.ConstructorElement;
 import io.micronaut.inject.ast.Element;
@@ -68,9 +68,6 @@ import java.util.stream.Stream;
  * @since 5.1.0
  */
 public class BeanInjectionUtils {
-
-    private static final List<BeanDefinitionInjectionPointResolver> INJECTION_POINT_RESOLVERS =
-        SoftServiceLoader.load(BeanDefinitionInjectionPointResolver.class, BeanInjectionUtils.class.getClassLoader()).collectAll();
 
     /**
      * Creates a {@link FieldDefinition} describing injection for the supplied field.
@@ -315,12 +312,15 @@ public class BeanInjectionUtils {
                     return result;
                 }
             }
-            for (BeanDefinitionInjectionPointResolver resolver : INJECTION_POINT_RESOLVERS) {
-                Optional<BeanDefinitionInjectionPoint<ClassElement>> resolved =
-                    resolver.resolve(beanType, genericType, annotationMetadata, parameterName, visitorContext);
-                if (resolved.isPresent()) {
-                    return resolved.get();
+            if (annotationMetadata.hasStereotype(ResolveWith.class)) {
+                String providerName = annotationMetadata.stringValue(ResolveWith.class).orElseThrow(() ->
+                    new IllegalArgumentException("ResolveWith requires a BeanInjectionProvider type"));
+                ClassElement provider = visitorContext.getClassElement(providerName).orElseThrow(() ->
+                    new IllegalArgumentException("The injection provider " + providerName + " is not on the classpath"));
+                if (!provider.isAssignable(BeanInjectionProvider.class)) {
+                    throw new IllegalArgumentException("The injection provider " + providerName + " must implement BeanInjectionProvider");
                 }
+                return new BeanInjectionPoint<>(genericType, annotationMetadata);
             }
             isArray = genericType.isArray();
             if (genericType.isAssignable(Collection.class) || isArray) {
